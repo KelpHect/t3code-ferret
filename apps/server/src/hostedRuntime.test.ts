@@ -291,6 +291,23 @@ async function waitForJobCompletion(
   throw new Error(`Timed out waiting for job ${jobId} to complete.`);
 }
 
+async function waitForProviderLoginSessionStatus(
+  harness: HostedRuntimeHarness,
+  sessionId: string,
+  statuses: string[],
+  timeoutMs = 10_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const session = await harness.runtime.getProviderLoginSession(TEST_USER, { sessionId });
+    if (statuses.includes(session.status)) {
+      return session;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for provider login session ${sessionId}.`);
+}
+
 function makeFakeCodexBinary(tempDir: string): {
   readonly binDir: string;
   readonly restore: () => void;
@@ -303,10 +320,38 @@ function makeFakeCodexBinary(tempDir: string): {
     runnerPath,
     [
       'const fs = require("node:fs");',
+      'const path = require("node:path");',
       "const args = process.argv.slice(2);",
+      "const codeHome = process.env.CODEX_HOME || process.cwd();",
+      'const authMarkerPath = path.join(codeHome, ".auth-state.json");',
       'if (args[0] === "login" && args[1] === "status") {',
-      "  process.stdout.write(JSON.stringify({ authenticated: true }));",
-      "  process.exit(0);",
+      "  if (fs.existsSync(authMarkerPath)) {",
+      "    process.stdout.write(JSON.stringify({ authenticated: true }));",
+      "    process.exit(0);",
+      "  }",
+      '  process.stderr.write("not logged in\\n");',
+      "  process.exit(1);",
+      "}",
+      'if (args[0] === "login" && args[1] === "--device-auth") {',
+      '  const verificationUrl = process.env.T3_FAKE_DEVICE_AUTH_URL ?? "https://auth.openai.com/codex/device";',
+      '  const userCode = process.env.T3_FAKE_DEVICE_AUTH_CODE ?? "SCBB-ITFPV";',
+      '  const expiryMinutes = process.env.T3_FAKE_DEVICE_AUTH_EXPIRES_MINUTES ?? "15";',
+      '  const outcome = process.env.T3_FAKE_DEVICE_AUTH_OUTCOME ?? "success";',
+      '  const delayMs = Number(process.env.T3_FAKE_DEVICE_AUTH_DELAY_MS ?? "40");',
+      '  process.stdout.write("Follow these steps to sign in with ChatGPT using device code authorization\\n");',
+      "  process.stdout.write(`${verificationUrl}\\n`);",
+      "  process.stdout.write(`${userCode}\\n`);",
+      "  process.stdout.write(`This code expires in ${expiryMinutes} minutes.\\n`);",
+      "  setTimeout(() => {",
+      '    if (outcome === "success") {',
+      "      fs.mkdirSync(codeHome, { recursive: true });",
+      "      fs.writeFileSync(authMarkerPath, JSON.stringify({ authenticated: true }), 'utf8');",
+      "      process.exit(0);",
+      "    }",
+      '    process.stderr.write(outcome === "expired" ? "Device code expired\\n" : "Authentication failed\\n");',
+      "    process.exit(1);",
+      "  }, Number.isFinite(delayMs) ? delayMs : 40);",
+      "  return;",
       "}",
       'let outputPath = "";',
       "for (let index = 0; index < args.length; index += 1) {",
@@ -357,6 +402,11 @@ function makeFakeCodexBinary(tempDir: string): {
       delete process.env.T3_EXPECT_CODEX_PROMPT;
       delete process.env.T3_FAKE_CODEX_LAST_MESSAGE;
       delete process.env.T3_FAKE_CODEX_EXIT_CODE;
+      delete process.env.T3_FAKE_DEVICE_AUTH_URL;
+      delete process.env.T3_FAKE_DEVICE_AUTH_CODE;
+      delete process.env.T3_FAKE_DEVICE_AUTH_EXPIRES_MINUTES;
+      delete process.env.T3_FAKE_DEVICE_AUTH_OUTCOME;
+      delete process.env.T3_FAKE_DEVICE_AUTH_DELAY_MS;
     },
   };
 }
@@ -437,6 +487,12 @@ describe("HostedRuntime", () => {
         "providers",
         "codex",
       );
+      fs.mkdirSync(providerHome, { recursive: true });
+      fs.writeFileSync(
+        path.join(providerHome, ".auth-state.json"),
+        JSON.stringify({ authenticated: true }),
+        "utf8",
+      );
       process.env.T3_EXPECT_CODEX_HOME = providerHome;
       process.env.T3_EXPECT_CODEX_PROMPT = "Summarize the repository";
       process.env.T3_FAKE_CODEX_LAST_MESSAGE = "Assistant completed the hosted job.";
@@ -459,6 +515,74 @@ describe("HostedRuntime", () => {
       expect(events.events.some((event) => event.type === "stderr")).toBe(true);
       expect(events.events.at(-1)?.payload).toMatchObject({
         lastMessage: "Assistant completed the hosted job.",
+      });
+    } finally {
+      fakeCodex.restore();
+    }
+  });
+
+  it("creates durable provider login sessions and authenticates the hosted Codex account", async () => {
+    const harness = await createHarness();
+    await harness.runtime.bootstrap();
+    const fakeCodex = makeFakeCodexBinary(harness.tempDir);
+
+    try {
+      const result = await harness.runtime.beginProviderLogin(TEST_USER, {
+        provider: "codex",
+      });
+      expect(result.account.status).toBe("running_login");
+      expect(result.session.status).toBe("awaiting_user");
+      expect(result.session.verificationUri).toBe("https://auth.openai.com/codex/device");
+      expect(result.session.userCode).toBe("SCBB-ITFPV");
+      expect(result.session.expiresAt).not.toBeNull();
+
+      const completedSession = await waitForProviderLoginSessionStatus(harness, result.session.id, [
+        "authenticated",
+      ]);
+      expect(completedSession.status).toBe("authenticated");
+      expect(completedSession.completedAt).not.toBeNull();
+
+      const accounts = await harness.runtime.listProviderAccounts(TEST_USER);
+      expect(accounts.accounts).toEqual([
+        expect.objectContaining({
+          provider: "codex",
+          status: "authenticated",
+          activeLoginSession: null,
+        }),
+      ]);
+    } finally {
+      fakeCodex.restore();
+    }
+  });
+
+  it("cancels active provider login sessions", async () => {
+    const harness = await createHarness();
+    await harness.runtime.bootstrap();
+    const fakeCodex = makeFakeCodexBinary(harness.tempDir);
+    process.env.T3_FAKE_DEVICE_AUTH_DELAY_MS = "500";
+
+    try {
+      const result = await harness.runtime.beginProviderLogin(TEST_USER, {
+        provider: "codex",
+      });
+      expect(result.session.status).toBe("awaiting_user");
+
+      const cancelled = await harness.runtime.cancelProviderLogin(TEST_USER, {
+        sessionId: result.session.id,
+      });
+      expect(cancelled.session.status).toBe("cancelled");
+      expect(cancelled.account.status).toBe("unauthenticated");
+
+      const session = await harness.runtime.getProviderLoginSession(TEST_USER, {
+        sessionId: result.session.id,
+      });
+      expect(session.status).toBe("cancelled");
+
+      const accounts = await harness.runtime.listProviderAccounts(TEST_USER);
+      expect(accounts.accounts[0]).toMatchObject({
+        provider: "codex",
+        status: "unauthenticated",
+        activeLoginSession: null,
       });
     } finally {
       fakeCodex.restore();

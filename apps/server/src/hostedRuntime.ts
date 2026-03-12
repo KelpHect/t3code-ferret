@@ -1,6 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import nodePath from "node:path";
+import type { Readable, Writable } from "node:stream";
 
 import {
   CommandId,
@@ -34,6 +35,9 @@ import {
   type HostedProviderAccount,
   type HostedProviderBeginLoginInput,
   type HostedProviderBeginLoginResult,
+  type HostedProviderCancelLoginResult,
+  type HostedProviderLoginSession,
+  type HostedProviderLoginSessionIdInput,
   type HostedProviderListResult,
   type HostedProviderLogoutResult,
   type HostedRunCommandJobInput,
@@ -50,8 +54,10 @@ import type { ServerConfigShape } from "./config";
 import type { GitCoreShape } from "./git/Services/GitCore";
 import type { OrchestrationEngineShape } from "./orchestration/Services/OrchestrationEngine";
 import type { ProjectionSnapshotQueryShape } from "./orchestration/Services/ProjectionSnapshotQuery";
+import { killChild } from "./processRunner";
 import type { TerminalManagerShape } from "./terminal/Services/Manager";
 import { clearWorkspaceIndexCache, searchWorkspaceEntries } from "./workspaceEntries";
+import { inferDeviceAuthFailure, parseCodexDeviceAuthPrompt } from "./provider/deviceAuth";
 import { parseAuthStatusFromOutput } from "./provider/Layers/ProviderHealth";
 
 const INLINE_FILE_LIMIT_BYTES = 512 * 1024;
@@ -106,6 +112,32 @@ interface UpdateJobRecordPatch {
   readonly resultSummary?: HostedJob["resultSummary"];
   readonly resultJson?: HostedJob["resultJson"];
 }
+
+interface UpdateProviderLoginSessionPatch {
+  readonly status?: HostedProviderLoginSession["status"];
+  readonly verificationUri?: HostedProviderLoginSession["verificationUri"];
+  readonly userCode?: HostedProviderLoginSession["userCode"];
+  readonly expiresAt?: HostedProviderLoginSession["expiresAt"];
+  readonly errorMessage?: HostedProviderLoginSession["errorMessage"];
+  readonly completedAt?: HostedProviderLoginSession["completedAt"];
+  readonly updatedAt?: HostedProviderLoginSession["updatedAt"];
+}
+
+interface ProviderLoginSessionRecord extends HostedProviderLoginSession {
+  readonly ownerClerkUserId: string;
+  readonly homePath: string;
+}
+
+interface ProviderLoginProcessEntry {
+  readonly child: ReturnType<typeof spawn>;
+  suppressFinalize: boolean;
+}
+
+type StreamingChildProcess = ReturnType<typeof spawn> & {
+  readonly stdin: Writable;
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+};
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -182,6 +214,17 @@ function mapHostedRuntimeModeToExecArgs(runtimeMode: RuntimeMode): ReadonlyArray
   return ["--dangerously-bypass-approvals-and-sandbox"];
 }
 
+function isTerminalProviderLoginSessionStatus(
+  status: HostedProviderLoginSession["status"],
+): boolean {
+  return (
+    status === "authenticated" ||
+    status === "expired" ||
+    status === "failed" ||
+    status === "cancelled"
+  );
+}
+
 type StreamingProcessResult = {
   readonly exitCode: number;
   readonly stdoutPreview: string;
@@ -253,14 +296,42 @@ function toHostedProviderAccountRow(value: Record<string, unknown>): HostedProvi
     status: value.status as HostedProviderAccount["status"],
     homePath: String(value.homePath ?? ""),
     message: typeof value.message === "string" ? value.message : null,
+    activeLoginSession: null,
     updatedAt: String(value.updatedAt ?? ""),
+  };
+}
+
+function toHostedProviderLoginSessionRow(
+  value: Record<string, unknown> | ProviderLoginSessionRecord,
+): HostedProviderLoginSession {
+  return {
+    id: String(value.id ?? ""),
+    provider: value.provider as HostedProviderLoginSession["provider"],
+    status: value.status as HostedProviderLoginSession["status"],
+    verificationUri: normalizeOptionalString(value.verificationUri),
+    userCode: normalizeOptionalString(value.userCode),
+    expiresAt: normalizeOptionalString(value.expiresAt),
+    errorMessage: typeof value.errorMessage === "string" ? value.errorMessage : null,
+    createdAt: String(value.createdAt ?? ""),
+    updatedAt: String(value.updatedAt ?? ""),
+    completedAt: normalizeOptionalString(value.completedAt),
+  };
+}
+
+function toProviderLoginSessionRecord(value: Record<string, unknown>): ProviderLoginSessionRecord {
+  return {
+    ...toHostedProviderLoginSessionRow(value),
+    ownerClerkUserId: String(value.ownerClerkUserId ?? ""),
+    homePath: String(value.homePath ?? ""),
   };
 }
 
 export class HostedRuntime {
   private readonly projectMutationLocks = new Map<string, Promise<void>>();
   private readonly jobEventLocks = new Map<string, Promise<void>>();
+  private readonly providerLoginLocks = new Map<string, Promise<void>>();
   private readonly backgroundJobs = new Map<string, Promise<void>>();
+  private readonly providerLoginProcesses = new Map<string, ProviderLoginProcessEntry>();
 
   constructor(private readonly options: HostedRuntimeOptions) {}
 
@@ -277,6 +348,7 @@ export class HostedRuntime {
         throw new Error(gitCheck.stderr.trim() || "Git is not available in self-hosted mode.");
       }
     }
+    await this.recoverProviderLoginSessions();
     await this.recoverPendingJobs();
   }
 
@@ -629,7 +701,7 @@ export class HostedRuntime {
   async listProviderAccounts(user: HostedUser): Promise<HostedProviderListResult> {
     const account = await this.refreshProviderAccountStatus(user.userId, "codex");
     return {
-      accounts: [account],
+      accounts: [await this.attachActiveProviderLoginSession(user.userId, account)],
     };
   }
 
@@ -637,40 +709,102 @@ export class HostedRuntime {
     user: HostedUser,
     input: HostedProviderBeginLoginInput,
   ): Promise<HostedProviderBeginLoginResult> {
-    const account = await this.ensureProviderAccount(user.userId, input.provider);
-    await this.updateProviderAccount(user.userId, input.provider, {
-      status: "running_login",
-      message: `Open a terminal with CODEX_HOME=${account.homePath} and run 'codex login'.`,
-    });
+    const providerKey = `${user.userId}:${input.provider}`;
+    return this.withLock(this.providerLoginLocks, providerKey, async () => {
+      if (input.provider !== "codex") {
+        throw new Error(`Provider '${input.provider}' device authentication is not implemented.`);
+      }
 
-    const job = await this.createStandaloneJobRecord({
-      ownerClerkUserId: user.userId,
-      projectId: ProjectId.makeUnsafe(`provider-${user.userId}-${input.provider}`),
-      cwd: account.homePath,
-      kind: "provider_login",
-      provider: input.provider,
-      title: `Authenticate ${input.provider}`,
-      command: "codex login",
-      inputJson: {
+      const refreshedAccount = await this.refreshProviderAccountStatus(user.userId, input.provider);
+      const activeSession = await this.getActiveProviderLoginSession(user.userId, input.provider);
+      if (activeSession) {
+        return {
+          account: await this.attachActiveProviderLoginSession(user.userId, refreshedAccount),
+          session: activeSession,
+        };
+      }
+
+      const account = await this.updateProviderAccount(user.userId, input.provider, {
+        status: "running_login",
+        message: "Starting Codex device authentication.",
+      });
+      const session = await this.createProviderLoginSession({
+        ownerClerkUserId: user.userId,
         provider: input.provider,
         homePath: account.homePath,
+      });
+      const readySession = await this.startProviderLoginSession(
+        user.userId,
+        account.homePath,
+        session,
+      );
+      return {
+        account: await this.attachActiveProviderLoginSession(user.userId, account),
+        session: readySession,
+      };
+    });
+  }
+
+  async getProviderLoginSession(
+    user: HostedUser,
+    input: HostedProviderLoginSessionIdInput,
+  ): Promise<HostedProviderLoginSession> {
+    const session = await this.getOwnedProviderLoginSession(user.userId, input.sessionId);
+    if (!session) {
+      throw new Error("Provider login session not found");
+    }
+    return session;
+  }
+
+  async cancelProviderLogin(
+    user: HostedUser,
+    input: HostedProviderLoginSessionIdInput,
+  ): Promise<HostedProviderCancelLoginResult> {
+    const session = await this.getProviderLoginSession(user, input);
+    if (isTerminalProviderLoginSessionStatus(session.status)) {
+      const account = await this.refreshProviderAccountStatus(user.userId, session.provider);
+      return {
+        account: await this.attachActiveProviderLoginSession(user.userId, account),
+        session,
+      };
+    }
+
+    const cancelledSession = await this.withLock(
+      this.providerLoginLocks,
+      `provider-login-session:${session.id}`,
+      async () => {
+        const current = await this.getProviderLoginSessionRecord(session.id);
+        if (!current || isTerminalProviderLoginSessionStatus(current.status)) {
+          return current ? toHostedProviderLoginSessionRow(current) : session;
+        }
+
+        return this.updateProviderLoginSession(session.id, {
+          status: "cancelled",
+          errorMessage: "Authentication cancelled.",
+          completedAt: nowIso(),
+        });
       },
-    });
-    await this.appendJobEvent({
-      ownerClerkUserId: user.userId,
-      jobId: job.id,
-      type: "info",
-      message: `Run 'codex login' inside ${account.homePath} to authenticate this account.`,
-    });
-    const completedJob = await this.updateJobRecord(job.id, {
-      status: "completed",
-      startedAt: nowIso(),
-      finishedAt: nowIso(),
-      exitCode: 0,
-      resultSummary: "Provider login requires an interactive terminal session.",
+    );
+
+    const processEntry = this.providerLoginProcesses.get(session.id);
+    if (processEntry) {
+      processEntry.suppressFinalize = true;
+      const closePromise = new Promise<void>((resolve) => {
+        processEntry.child.once("close", () => resolve());
+      });
+      killChild(processEntry.child);
+      await Promise.race([
+        closePromise,
+        new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+      ]);
+    }
+    const account = await this.updateProviderAccount(user.userId, session.provider, {
+      status: "unauthenticated",
+      message: "Authentication cancelled.",
     });
     return {
-      job: completedJob,
+      account: await this.attachActiveProviderLoginSession(user.userId, account),
+      session: cancelledSession,
     };
   }
 
@@ -678,6 +812,10 @@ export class HostedRuntime {
     user: HostedUser,
     input: HostedProviderBeginLoginInput,
   ): Promise<HostedProviderLogoutResult> {
+    const activeSession = await this.getActiveProviderLoginSession(user.userId, input.provider);
+    if (activeSession && !isTerminalProviderLoginSessionStatus(activeSession.status)) {
+      await this.cancelProviderLogin(user, { sessionId: activeSession.id });
+    }
     const account = await this.ensureProviderAccount(user.userId, input.provider);
     await fs.rm(account.homePath, { recursive: true, force: true });
     await fs.mkdir(account.homePath, { recursive: true });
@@ -686,7 +824,7 @@ export class HostedRuntime {
       message: `Cleared ${input.provider} account state.`,
     });
     return {
-      account: updated,
+      account: await this.attachActiveProviderLoginSession(user.userId, updated),
     };
   }
 
@@ -953,6 +1091,49 @@ export class HostedRuntime {
         continue;
       }
       await this.interruptRecoveredJob(job, interruptedAt);
+    }
+  }
+
+  private async recoverProviderLoginSessions(): Promise<void> {
+    const rows = (await this.options.runEffect(this.options.sql`
+      SELECT
+        session_id AS "id",
+        owner_clerk_user_id AS "ownerClerkUserId",
+        provider,
+        status,
+        home_path AS "homePath",
+        verification_uri AS "verificationUri",
+        user_code AS "userCode",
+        expires_at AS "expiresAt",
+        error_message AS "errorMessage",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt",
+        completed_at AS "completedAt"
+      FROM provider_login_sessions
+      WHERE status IN ('pending', 'awaiting_user')
+      ORDER BY created_at ASC
+    `)) as Array<Record<string, unknown>>;
+
+    const recoveredAt = nowIso();
+    for (const row of rows) {
+      const session = toProviderLoginSessionRecord(row);
+      const status =
+        session.expiresAt !== null && Date.parse(recoveredAt) >= Date.parse(session.expiresAt)
+          ? "expired"
+          : "failed";
+      const message =
+        status === "expired"
+          ? "Authentication session expired while the server was offline."
+          : "Authentication session interrupted by server restart.";
+      await this.updateProviderLoginSession(session.id, {
+        status,
+        errorMessage: message,
+        completedAt: recoveredAt,
+      });
+      await this.updateProviderAccount(session.ownerClerkUserId, session.provider, {
+        status: "unauthenticated",
+        message,
+      });
     }
   }
 
@@ -1332,7 +1513,7 @@ export class HostedRuntime {
   private async runStreamingJobProcess(input: {
     readonly jobId: HostedJob["id"];
     readonly ownerClerkUserId: string;
-    readonly start: () => ChildProcessWithoutNullStreams;
+    readonly start: () => StreamingChildProcess;
     readonly stdinText: string | undefined;
     readonly onSpawn?: () => Promise<void>;
   }): Promise<StreamingProcessResult> {
@@ -1379,7 +1560,7 @@ export class HostedRuntime {
     const exitCode = await new Promise<number>((resolve, reject) => {
       child.once("error", reject);
       child.stdin.once("error", reject);
-      child.once("close", (code) => {
+      child.once("close", (code: number | null) => {
         resolve(code ?? 1);
       });
 
@@ -1563,6 +1744,7 @@ export class HostedRuntime {
       status: "unknown",
       homePath,
       message: null,
+      activeLoginSession: null,
       updatedAt: createdAt,
     };
   }
@@ -1611,6 +1793,7 @@ export class HostedRuntime {
       ...current,
       status: patch.status,
       message: patch.message,
+      activeLoginSession: null,
       updatedAt,
     };
   }
@@ -1618,8 +1801,21 @@ export class HostedRuntime {
   private async refreshProviderAccountStatus(
     ownerClerkUserId: string,
     provider: ProviderKind,
+    options?: {
+      readonly ignoreActiveLoginSession?: boolean;
+    },
   ): Promise<HostedProviderAccount> {
     const account = await this.ensureProviderAccount(ownerClerkUserId, provider);
+    const activeLoginSession =
+      options?.ignoreActiveLoginSession === true
+        ? null
+        : await this.getActiveProviderLoginSession(ownerClerkUserId, provider);
+    if (activeLoginSession) {
+      return this.updateProviderAccount(ownerClerkUserId, provider, {
+        status: "running_login",
+        message: this.providerLoginAccountMessage(activeLoginSession),
+      });
+    }
     if (provider !== "codex") {
       return this.updateProviderAccount(ownerClerkUserId, provider, {
         status: "unknown",
@@ -1649,6 +1845,426 @@ export class HostedRuntime {
       status,
       message: parsed.message ?? null,
     });
+  }
+
+  private providerLoginAccountMessage(session: HostedProviderLoginSession): string {
+    if (session.userCode && session.verificationUri) {
+      return `Open ${session.verificationUri} and enter code ${session.userCode}.`;
+    }
+    if (session.userCode) {
+      return `Enter code ${session.userCode} to finish authentication.`;
+    }
+    return "Waiting for device authentication details from Codex.";
+  }
+
+  private async attachActiveProviderLoginSession(
+    ownerClerkUserId: string,
+    account: HostedProviderAccount,
+  ): Promise<HostedProviderAccount> {
+    return {
+      ...account,
+      activeLoginSession: await this.getActiveProviderLoginSession(
+        ownerClerkUserId,
+        account.provider,
+      ),
+    };
+  }
+
+  private async createProviderLoginSession(input: {
+    readonly ownerClerkUserId: string;
+    readonly provider: ProviderKind;
+    readonly homePath: string;
+  }): Promise<HostedProviderLoginSession> {
+    const createdAt = nowIso();
+    const session: ProviderLoginSessionRecord = {
+      id: crypto.randomUUID(),
+      ownerClerkUserId: input.ownerClerkUserId,
+      provider: input.provider,
+      status: "pending",
+      homePath: input.homePath,
+      verificationUri: null,
+      userCode: null,
+      expiresAt: null,
+      errorMessage: null,
+      createdAt,
+      updatedAt: createdAt,
+      completedAt: null,
+    };
+
+    await this.options.runEffect(this.options.sql`
+      INSERT INTO provider_login_sessions (
+        session_id,
+        owner_clerk_user_id,
+        provider,
+        status,
+        home_path,
+        verification_uri,
+        user_code,
+        expires_at,
+        error_message,
+        created_at,
+        updated_at,
+        completed_at
+      )
+      VALUES (
+        ${session.id},
+        ${session.ownerClerkUserId},
+        ${session.provider},
+        ${session.status},
+        ${session.homePath},
+        ${session.verificationUri},
+        ${session.userCode},
+        ${session.expiresAt},
+        ${session.errorMessage},
+        ${session.createdAt},
+        ${session.updatedAt},
+        ${session.completedAt}
+      )
+    `);
+
+    return toHostedProviderLoginSessionRow(session);
+  }
+
+  private async getProviderLoginSessionRecord(
+    sessionId: HostedProviderLoginSession["id"],
+  ): Promise<ProviderLoginSessionRecord | null> {
+    const rows = (await this.options.runEffect(this.options.sql`
+      SELECT
+        session_id AS "id",
+        owner_clerk_user_id AS "ownerClerkUserId",
+        provider,
+        status,
+        home_path AS "homePath",
+        verification_uri AS "verificationUri",
+        user_code AS "userCode",
+        expires_at AS "expiresAt",
+        error_message AS "errorMessage",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt",
+        completed_at AS "completedAt"
+      FROM provider_login_sessions
+      WHERE session_id = ${sessionId}
+      LIMIT 1
+    `)) as Array<Record<string, unknown>>;
+    const row = rows[0];
+    return row ? toProviderLoginSessionRecord(row) : null;
+  }
+
+  private async getOwnedProviderLoginSession(
+    ownerClerkUserId: string,
+    sessionId: HostedProviderLoginSession["id"],
+  ): Promise<HostedProviderLoginSession | null> {
+    const rows = (await this.options.runEffect(this.options.sql`
+      SELECT
+        session_id AS "id",
+        owner_clerk_user_id AS "ownerClerkUserId",
+        provider,
+        status,
+        home_path AS "homePath",
+        verification_uri AS "verificationUri",
+        user_code AS "userCode",
+        expires_at AS "expiresAt",
+        error_message AS "errorMessage",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt",
+        completed_at AS "completedAt"
+      FROM provider_login_sessions
+      WHERE session_id = ${sessionId}
+        AND owner_clerk_user_id = ${ownerClerkUserId}
+      LIMIT 1
+    `)) as Array<Record<string, unknown>>;
+    const row = rows[0];
+    return row ? toHostedProviderLoginSessionRow(row) : null;
+  }
+
+  private async getActiveProviderLoginSession(
+    ownerClerkUserId: string,
+    provider: ProviderKind,
+  ): Promise<HostedProviderLoginSession | null> {
+    const rows = (await this.options.runEffect(this.options.sql`
+      SELECT
+        session_id AS "id",
+        owner_clerk_user_id AS "ownerClerkUserId",
+        provider,
+        status,
+        home_path AS "homePath",
+        verification_uri AS "verificationUri",
+        user_code AS "userCode",
+        expires_at AS "expiresAt",
+        error_message AS "errorMessage",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt",
+        completed_at AS "completedAt"
+      FROM provider_login_sessions
+      WHERE owner_clerk_user_id = ${ownerClerkUserId}
+        AND provider = ${provider}
+        AND status IN ('pending', 'awaiting_user')
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `)) as Array<Record<string, unknown>>;
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+
+    const session = toProviderLoginSessionRecord(row);
+    if (
+      session.expiresAt !== null &&
+      Date.parse(nowIso()) >= Date.parse(session.expiresAt) &&
+      !isTerminalProviderLoginSessionStatus(session.status)
+    ) {
+      const activeProcess = this.providerLoginProcesses.get(session.id);
+      if (activeProcess) {
+        killChild(activeProcess.child);
+      }
+      const expiredSession = await this.updateProviderLoginSession(session.id, {
+        status: "expired",
+        errorMessage: "Authentication session expired.",
+        completedAt: nowIso(),
+      });
+      await this.updateProviderAccount(ownerClerkUserId, provider, {
+        status: "unauthenticated",
+        message: "Authentication session expired.",
+      });
+      return expiredSession;
+    }
+
+    return toHostedProviderLoginSessionRow(session);
+  }
+
+  private async updateProviderLoginSession(
+    sessionId: HostedProviderLoginSession["id"],
+    patch: UpdateProviderLoginSessionPatch,
+  ): Promise<HostedProviderLoginSession> {
+    const existing = await this.getProviderLoginSessionRecord(sessionId);
+    if (!existing) {
+      throw new Error(`Unknown provider login session: ${sessionId}`);
+    }
+
+    const next: ProviderLoginSessionRecord = {
+      ...existing,
+      ...patch,
+      updatedAt: patch.updatedAt ?? nowIso(),
+    };
+
+    await this.options.runEffect(this.options.sql`
+      UPDATE provider_login_sessions
+      SET
+        owner_clerk_user_id = ${next.ownerClerkUserId},
+        provider = ${next.provider},
+        status = ${next.status},
+        home_path = ${next.homePath},
+        verification_uri = ${next.verificationUri},
+        user_code = ${next.userCode},
+        expires_at = ${next.expiresAt},
+        error_message = ${next.errorMessage},
+        updated_at = ${next.updatedAt},
+        completed_at = ${next.completedAt}
+      WHERE session_id = ${sessionId}
+    `);
+
+    return toHostedProviderLoginSessionRow(next);
+  }
+
+  private async waitForProviderLoginSessionReady(
+    sessionId: HostedProviderLoginSession["id"],
+    timeoutMs = 5_000,
+  ): Promise<HostedProviderLoginSession> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const session = await this.getProviderLoginSessionRecord(sessionId);
+      if (!session) {
+        throw new Error("Provider login session not found");
+      }
+      if (
+        isTerminalProviderLoginSessionStatus(session.status) ||
+        session.verificationUri !== null ||
+        session.userCode !== null
+      ) {
+        return toHostedProviderLoginSessionRow(session);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    const session = await this.getProviderLoginSessionRecord(sessionId);
+    if (!session) {
+      throw new Error("Provider login session not found");
+    }
+    return toHostedProviderLoginSessionRow(session);
+  }
+
+  private async startProviderLoginSession(
+    ownerClerkUserId: string,
+    homePath: string,
+    session: HostedProviderLoginSession,
+  ): Promise<HostedProviderLoginSession> {
+    await fs.mkdir(homePath, { recursive: true });
+
+    const child = spawn("codex", ["login", "--device-auth"], {
+      cwd: homePath,
+      env: {
+        ...process.env,
+        CODEX_HOME: homePath,
+      },
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    const processEntry: ProviderLoginProcessEntry = {
+      child,
+      suppressFinalize: false,
+    };
+    this.providerLoginProcesses.set(session.id, processEntry);
+
+    let combinedOutput = "";
+    const consumeOutput = (chunk: string) => {
+      combinedOutput += chunk;
+      void this.withLock(
+        this.providerLoginLocks,
+        `provider-login-session:${session.id}`,
+        async () => {
+          const current = await this.getProviderLoginSessionRecord(session.id);
+          if (!current || isTerminalProviderLoginSessionStatus(current.status)) {
+            return;
+          }
+          const parsed = parseCodexDeviceAuthPrompt(combinedOutput, current.createdAt);
+          const nextStatus =
+            current.status === "pending" &&
+            (parsed.verificationUri !== null ||
+              parsed.userCode !== null ||
+              parsed.expiresAt !== null)
+              ? "awaiting_user"
+              : current.status;
+          const nextVerificationUri = parsed.verificationUri ?? current.verificationUri;
+          const nextUserCode = parsed.userCode ?? current.userCode;
+          const nextExpiresAt = parsed.expiresAt ?? current.expiresAt;
+          if (
+            nextStatus === current.status &&
+            nextVerificationUri === current.verificationUri &&
+            nextUserCode === current.userCode &&
+            nextExpiresAt === current.expiresAt
+          ) {
+            return;
+          }
+
+          const updatedSession = await this.updateProviderLoginSession(session.id, {
+            status: nextStatus,
+            verificationUri: nextVerificationUri,
+            userCode: nextUserCode,
+            expiresAt: nextExpiresAt,
+            errorMessage: null,
+          });
+          await this.updateProviderAccount(ownerClerkUserId, updatedSession.provider, {
+            status: "running_login",
+            message: this.providerLoginAccountMessage(updatedSession),
+          });
+        },
+      ).catch(() => undefined);
+    };
+
+    child.stdout.on("data", consumeOutput);
+    child.stderr.on("data", consumeOutput);
+    child.once("error", (error) => {
+      if (processEntry.suppressFinalize) {
+        this.providerLoginProcesses.delete(session.id);
+        return;
+      }
+      void this.finalizeProviderLoginSession(session.id, ownerClerkUserId, combinedOutput, {
+        exitCode: 1,
+        errorMessage:
+          error instanceof Error ? error.message : "Failed to start provider login process.",
+      });
+    });
+    child.once("close", (code) => {
+      if (processEntry.suppressFinalize) {
+        this.providerLoginProcesses.delete(session.id);
+        return;
+      }
+      void this.finalizeProviderLoginSession(session.id, ownerClerkUserId, combinedOutput, {
+        exitCode: code ?? 1,
+        errorMessage: null,
+      });
+    });
+
+    return this.waitForProviderLoginSessionReady(session.id);
+  }
+
+  private async finalizeProviderLoginSession(
+    sessionId: HostedProviderLoginSession["id"],
+    ownerClerkUserId: string,
+    output: string,
+    result: {
+      readonly exitCode: number;
+      readonly errorMessage: string | null;
+    },
+  ): Promise<void> {
+    this.providerLoginProcesses.delete(sessionId);
+
+    await this.withLock(
+      this.providerLoginLocks,
+      `provider-login-session:${sessionId}`,
+      async () => {
+        const current = await this.getProviderLoginSessionRecord(sessionId);
+        if (!current || isTerminalProviderLoginSessionStatus(current.status)) {
+          return;
+        }
+
+        if (result.exitCode === 0) {
+          const account = await this.refreshProviderAccountStatus(
+            ownerClerkUserId,
+            current.provider,
+            {
+              ignoreActiveLoginSession: true,
+            },
+          );
+          if (account.status === "authenticated") {
+            await this.updateProviderLoginSession(sessionId, {
+              status: "authenticated",
+              errorMessage: null,
+              completedAt: nowIso(),
+            });
+            return;
+          }
+
+          const failureMessage = account.message ?? "Authentication did not complete.";
+          await this.updateProviderLoginSession(sessionId, {
+            status: "failed",
+            errorMessage: failureMessage,
+            completedAt: nowIso(),
+          });
+          await this.updateProviderAccount(ownerClerkUserId, current.provider, {
+            status: "unauthenticated",
+            message: failureMessage,
+          });
+          return;
+        }
+
+        const now = nowIso();
+        const failureStatus = inferDeviceAuthFailure({
+          output,
+          expiresAt: current.expiresAt,
+          now,
+        });
+        const failureMessage =
+          result.errorMessage ??
+          summarizeText(
+            output,
+            failureStatus === "expired"
+              ? "Authentication session expired."
+              : "Authentication failed.",
+          );
+        await this.updateProviderLoginSession(sessionId, {
+          status: failureStatus,
+          errorMessage: failureMessage,
+          completedAt: now,
+        });
+        await this.updateProviderAccount(ownerClerkUserId, current.provider, {
+          status: "unauthenticated",
+          message: failureMessage,
+        });
+      },
+    );
   }
 
   private async ensureUniqueProjectSlug(

@@ -31,6 +31,19 @@ export const HostedProviderAccountStatus = Schema.Literals([
 ]);
 export type HostedProviderAccountStatus = typeof HostedProviderAccountStatus.Type;
 
+export const HostedProviderLoginSessionStatus = Schema.Literals([
+  "pending",
+  "awaiting_user",
+  "authenticated",
+  "expired",
+  "failed",
+  "cancelled",
+]);
+export type HostedProviderLoginSessionStatus = typeof HostedProviderLoginSessionStatus.Type;
+
+export const HostedProviderLoginSessionId = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
+export type HostedProviderLoginSessionId = typeof HostedProviderLoginSessionId.Type;
+
 export const HostedJobKind = Schema.Literals([
   "clone_repo",
   "git_branch_create",
@@ -295,11 +308,26 @@ export const HostedAgentPromptJobInput = Schema.Struct({
 });
 export type HostedAgentPromptJobInput = typeof HostedAgentPromptJobInput.Type;
 
+export const HostedProviderLoginSession = Schema.Struct({
+  id: HostedProviderLoginSessionId,
+  provider: ProviderKind,
+  status: HostedProviderLoginSessionStatus,
+  verificationUri: Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(2_048))),
+  userCode: Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(64))),
+  expiresAt: Schema.NullOr(IsoDateTime),
+  errorMessage: Schema.NullOr(Schema.String),
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+  completedAt: Schema.NullOr(IsoDateTime),
+});
+export type HostedProviderLoginSession = typeof HostedProviderLoginSession.Type;
+
 export const HostedProviderAccount = Schema.Struct({
   provider: ProviderKind,
   status: HostedProviderAccountStatus,
   homePath: TrimmedNonEmptyString,
   message: Schema.NullOr(Schema.String),
+  activeLoginSession: Schema.NullOr(HostedProviderLoginSession),
   updatedAt: IsoDateTime,
 });
 export type HostedProviderAccount = typeof HostedProviderAccount.Type;
@@ -324,10 +352,22 @@ export const HostedProviderBeginLoginInput = Schema.Struct({
 });
 export type HostedProviderBeginLoginInput = typeof HostedProviderBeginLoginInput.Type;
 
+export const HostedProviderLoginSessionIdInput = Schema.Struct({
+  sessionId: HostedProviderLoginSessionId,
+});
+export type HostedProviderLoginSessionIdInput = typeof HostedProviderLoginSessionIdInput.Type;
+
 export const HostedProviderBeginLoginResult = Schema.Struct({
-  job: HostedJob,
+  account: HostedProviderAccount,
+  session: HostedProviderLoginSession,
 });
 export type HostedProviderBeginLoginResult = typeof HostedProviderBeginLoginResult.Type;
+
+export const HostedProviderCancelLoginResult = Schema.Struct({
+  account: HostedProviderAccount,
+  session: HostedProviderLoginSession,
+});
+export type HostedProviderCancelLoginResult = typeof HostedProviderCancelLoginResult.Type;
 
 export const HostedProviderLogoutResult = Schema.Struct({
   account: HostedProviderAccount,

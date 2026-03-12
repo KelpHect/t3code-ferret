@@ -74,6 +74,9 @@ import type {
   HostedProjectWriteFileResult,
   HostedProviderBeginLoginInput,
   HostedProviderBeginLoginResult,
+  HostedProviderCancelLoginResult,
+  HostedProviderLoginSession,
+  HostedProviderLoginSessionIdInput,
   HostedProviderListResult,
   HostedProviderLogoutResult,
   HostedRunCommandJobInput,
@@ -223,6 +226,12 @@ export interface NativeApi {
   providers: {
     list: () => Promise<HostedProviderListResult>;
     beginLogin: (input: HostedProviderBeginLoginInput) => Promise<HostedProviderBeginLoginResult>;
+    getLoginSession: (
+      input: HostedProviderLoginSessionIdInput,
+    ) => Promise<HostedProviderLoginSession>;
+    cancelLogin: (
+      input: HostedProviderLoginSessionIdInput,
+    ) => Promise<HostedProviderCancelLoginResult>;
     logout: (input: HostedProviderBeginLoginInput) => Promise<HostedProviderLogoutResult>;
   };
   orchestration: {

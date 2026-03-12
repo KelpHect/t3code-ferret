@@ -1,14 +1,21 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
-import { type ProviderKind } from "@t3tools/contracts";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { type ProviderKind, type HostedProviderLoginSessionId } from "@t3tools/contracts";
 import { getModelOptions, normalizeModelSlug } from "@t3tools/shared/model";
 
 import { MAX_CUSTOM_MODEL_LENGTH, useAppSettings } from "../appSettings";
 import { isElectron } from "../env";
 import { useTheme } from "../hooks/useTheme";
-import { serverConfigQueryOptions } from "../lib/serverReactQuery";
+import {
+  hostedProviderAccountsQueryOptions,
+  hostedProviderLoginSessionQueryOptions,
+  providerQueryKeys,
+} from "../lib/providerReactQuery";
+import { openProviderLoginPopup } from "../lib/providerLoginBridge";
+import { serverConfigQueryOptions, serverQueryKeys } from "../lib/serverReactQuery";
 import { ensureNativeApi } from "../nativeApi";
+import { useRuntimePublicConfig } from "../runtimeConfig";
 import { preferredTerminalEditor } from "../terminal-links";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -81,11 +88,23 @@ function patchCustomModels(provider: ProviderKind, models: string[]) {
 }
 
 function SettingsRouteView() {
+  const runtimeConfig = useRuntimePublicConfig();
   const { theme, setTheme, resolvedTheme } = useTheme();
   const { settings, defaults, updateSettings } = useAppSettings();
+  const queryClient = useQueryClient();
   const serverConfigQuery = useQuery(serverConfigQueryOptions());
+  const providerAccountsQuery = useQuery(
+    hostedProviderAccountsQueryOptions(runtimeConfig.deploymentMode === "self-hosted"),
+  );
   const [isOpeningKeybindings, setIsOpeningKeybindings] = useState(false);
   const [openKeybindingsError, setOpenKeybindingsError] = useState<string | null>(null);
+  const [providerActionError, setProviderActionError] = useState<string | null>(null);
+  const [providerActionPending, setProviderActionPending] = useState<
+    "beginLogin" | "cancelLogin" | "logout" | null
+  >(null);
+  const [activeProviderLoginSessionId, setActiveProviderLoginSessionId] =
+    useState<HostedProviderLoginSessionId | null>(null);
+  const providerLoginPopupRef = useRef<Window | null>(null);
   const [customModelInputByProvider, setCustomModelInputByProvider] = useState<
     Record<ProviderKind, string>
   >({
@@ -98,6 +117,21 @@ function SettingsRouteView() {
   const codexBinaryPath = settings.codexBinaryPath;
   const codexHomePath = settings.codexHomePath;
   const keybindingsConfigPath = serverConfigQuery.data?.keybindingsConfigPath ?? null;
+  const codexAccount = providerAccountsQuery.data?.accounts.find(
+    (account) => account.provider === "codex",
+  );
+  const effectiveProviderLoginSessionId =
+    activeProviderLoginSessionId ?? codexAccount?.activeLoginSession?.id ?? null;
+  const providerLoginSessionQuery = useQuery(
+    hostedProviderLoginSessionQueryOptions(
+      effectiveProviderLoginSessionId,
+      runtimeConfig.deploymentMode === "self-hosted",
+    ),
+  );
+  const activeProviderLoginSession =
+    effectiveProviderLoginSessionId !== null
+      ? (providerLoginSessionQuery.data ?? codexAccount?.activeLoginSession ?? null)
+      : (codexAccount?.activeLoginSession ?? null);
 
   const openKeybindingsFile = useCallback(() => {
     if (!keybindingsConfigPath) return;
@@ -115,6 +149,94 @@ function SettingsRouteView() {
         setIsOpeningKeybindings(false);
       });
   }, [keybindingsConfigPath]);
+
+  const invalidateHostedProviderState = useCallback(async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: providerQueryKeys.accounts() }),
+      queryClient.invalidateQueries({ queryKey: serverQueryKeys.config() }),
+    ]);
+  }, [queryClient]);
+
+  useEffect(() => {
+    if (!activeProviderLoginSession) {
+      return;
+    }
+    if (
+      activeProviderLoginSession.status === "pending" ||
+      activeProviderLoginSession.status === "awaiting_user"
+    ) {
+      return;
+    }
+    providerLoginPopupRef.current?.close();
+    providerLoginPopupRef.current = null;
+    setActiveProviderLoginSessionId(null);
+    void invalidateHostedProviderState();
+  }, [activeProviderLoginSession, invalidateHostedProviderState]);
+
+  const beginHostedProviderLogin = useCallback(async () => {
+    setProviderActionError(null);
+    setProviderActionPending("beginLogin");
+    try {
+      const api = ensureNativeApi();
+      const result = await api.providers.beginLogin({ provider: "codex" });
+      setActiveProviderLoginSessionId(result.session.id);
+      await invalidateHostedProviderState();
+      const popup = openProviderLoginPopup(result.session.id);
+      providerLoginPopupRef.current = popup;
+      if (!popup) {
+        setProviderActionError(
+          "Popup blocked. Use the verification URL and code below to continue manually.",
+        );
+      }
+    } catch (error) {
+      setProviderActionError(
+        error instanceof Error ? error.message : "Unable to start Codex authentication.",
+      );
+    } finally {
+      setProviderActionPending(null);
+    }
+  }, [invalidateHostedProviderState]);
+
+  const cancelHostedProviderLogin = useCallback(async () => {
+    if (!effectiveProviderLoginSessionId) {
+      return;
+    }
+    setProviderActionError(null);
+    setProviderActionPending("cancelLogin");
+    try {
+      const api = ensureNativeApi();
+      await api.providers.cancelLogin({ sessionId: effectiveProviderLoginSessionId });
+      providerLoginPopupRef.current?.close();
+      providerLoginPopupRef.current = null;
+      setActiveProviderLoginSessionId(null);
+      await invalidateHostedProviderState();
+    } catch (error) {
+      setProviderActionError(
+        error instanceof Error ? error.message : "Unable to cancel Codex authentication.",
+      );
+    } finally {
+      setProviderActionPending(null);
+    }
+  }, [effectiveProviderLoginSessionId, invalidateHostedProviderState]);
+
+  const logoutHostedProvider = useCallback(async () => {
+    setProviderActionError(null);
+    setProviderActionPending("logout");
+    try {
+      const api = ensureNativeApi();
+      await api.providers.logout({ provider: "codex" });
+      providerLoginPopupRef.current?.close();
+      providerLoginPopupRef.current = null;
+      setActiveProviderLoginSessionId(null);
+      await invalidateHostedProviderState();
+    } catch (error) {
+      setProviderActionError(
+        error instanceof Error ? error.message : "Unable to clear the hosted Codex account.",
+      );
+    } finally {
+      setProviderActionPending(null);
+    }
+  }, [invalidateHostedProviderState]);
 
   const addCustomModel = useCallback(
     (provider: ProviderKind) => {
@@ -196,9 +318,144 @@ function SettingsRouteView() {
             <header className="space-y-1">
               <h1 className="text-2xl font-semibold tracking-tight text-foreground">Settings</h1>
               <p className="text-sm text-muted-foreground">
-                Configure app-level preferences for this device.
+                {runtimeConfig.deploymentMode === "self-hosted"
+                  ? "Configure browser preferences and hosted provider access."
+                  : "Configure app-level preferences for this device."}
               </p>
             </header>
+
+            {runtimeConfig.deploymentMode === "self-hosted" ? (
+              <section className="rounded-2xl border border-border bg-card p-5">
+                <div className="mb-4">
+                  <h2 className="text-sm font-medium text-foreground">Hosted Providers</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Authenticate your server-hosted Codex account for durable CLI jobs.
+                  </p>
+                </div>
+
+                {providerAccountsQuery.isPending && !codexAccount ? (
+                  <div className="rounded-lg border border-border bg-background px-3 py-4 text-sm text-muted-foreground">
+                    Loading provider account status...
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="rounded-xl border border-border bg-background/60 p-4">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-medium text-foreground">Codex</p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Status:{" "}
+                            <span className="font-medium text-foreground">
+                              {codexAccount?.status ?? "unknown"}
+                            </span>
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {codexAccount?.message ?? "No active authentication session."}
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {activeProviderLoginSession ? (
+                            <>
+                              <Button
+                                onClick={() => {
+                                  if (!activeProviderLoginSession) {
+                                    return;
+                                  }
+                                  providerLoginPopupRef.current = openProviderLoginPopup(
+                                    activeProviderLoginSession.id,
+                                  );
+                                }}
+                              >
+                                Open login window
+                              </Button>
+                              <Button
+                                variant="outline"
+                                disabled={providerActionPending !== null}
+                                onClick={() => void cancelHostedProviderLogin()}
+                              >
+                                {providerActionPending === "cancelLogin"
+                                  ? "Cancelling..."
+                                  : "Cancel login"}
+                              </Button>
+                            </>
+                          ) : (
+                            <Button
+                              disabled={providerActionPending !== null}
+                              onClick={() => void beginHostedProviderLogin()}
+                            >
+                              {providerActionPending === "beginLogin"
+                                ? "Starting..."
+                                : codexAccount?.status === "authenticated"
+                                  ? "Reconnect Codex"
+                                  : "Connect Codex"}
+                            </Button>
+                          )}
+                          <Button
+                            variant="outline"
+                            disabled={providerActionPending !== null}
+                            onClick={() => void logoutHostedProvider()}
+                          >
+                            {providerActionPending === "logout" ? "Clearing..." : "Clear account"}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {activeProviderLoginSession ? (
+                      <div className="rounded-xl border border-border bg-background/60 p-4">
+                        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                          Active device-auth session
+                        </p>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-lg border border-border bg-card px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                              Code
+                            </p>
+                            <code className="mt-1 block text-sm font-semibold tracking-[0.16em] text-foreground">
+                              {activeProviderLoginSession.userCode ?? "Waiting..."}
+                            </code>
+                          </div>
+                          <div className="rounded-lg border border-border bg-card px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                              Expires
+                            </p>
+                            <p className="mt-1 text-sm text-foreground">
+                              {activeProviderLoginSession.expiresAt
+                                ? new Date(activeProviderLoginSession.expiresAt).toLocaleString()
+                                : "Waiting..."}
+                            </p>
+                          </div>
+                        </div>
+                        {activeProviderLoginSession.verificationUri ? (
+                          <div className="mt-3 rounded-lg border border-border bg-card px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                              Verification URL
+                            </p>
+                            <p className="mt-1 break-all text-xs text-foreground">
+                              {activeProviderLoginSession.verificationUri}
+                            </p>
+                          </div>
+                        ) : null}
+                        {activeProviderLoginSession.errorMessage ? (
+                          <p className="mt-3 text-xs text-destructive">
+                            {activeProviderLoginSession.errorMessage}
+                          </p>
+                        ) : (
+                          <p className="mt-3 text-xs text-muted-foreground">
+                            Open the login window, sign in to OpenAI, and enter the one-time code.
+                            The account status will update automatically.
+                          </p>
+                        )}
+                      </div>
+                    ) : null}
+
+                    {providerActionError ? (
+                      <p className="text-xs text-destructive">{providerActionError}</p>
+                    ) : null}
+                  </div>
+                )}
+              </section>
+            ) : null}
 
             <section className="rounded-2xl border border-border bg-card p-5">
               <div className="mb-4">
@@ -243,66 +500,69 @@ function SettingsRouteView() {
               </p>
             </section>
 
-            <section className="rounded-2xl border border-border bg-card p-5">
-              <div className="mb-4">
-                <h2 className="text-sm font-medium text-foreground">Codex App Server</h2>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  These overrides apply to new sessions and let you use a non-default Codex install.
-                </p>
-              </div>
-
-              <div className="space-y-4">
-                <label htmlFor="codex-binary-path" className="block space-y-1">
-                  <span className="text-xs font-medium text-foreground">Codex binary path</span>
-                  <Input
-                    id="codex-binary-path"
-                    value={codexBinaryPath}
-                    onChange={(event) => updateSettings({ codexBinaryPath: event.target.value })}
-                    placeholder="codex"
-                    spellCheck={false}
-                  />
-                  <span className="text-xs text-muted-foreground">
-                    Leave blank to use <code>codex</code> from your PATH.
-                  </span>
-                </label>
-
-                <label htmlFor="codex-home-path" className="block space-y-1">
-                  <span className="text-xs font-medium text-foreground">CODEX_HOME path</span>
-                  <Input
-                    id="codex-home-path"
-                    value={codexHomePath}
-                    onChange={(event) => updateSettings({ codexHomePath: event.target.value })}
-                    placeholder="/Users/you/.codex"
-                    spellCheck={false}
-                  />
-                  <span className="text-xs text-muted-foreground">
-                    Optional custom Codex home/config directory.
-                  </span>
-                </label>
-
-                <div className="flex flex-col gap-3 text-xs text-muted-foreground sm:flex-row sm:items-start sm:justify-between">
-                  <div className="min-w-0 flex-1">
-                    <p>Binary source</p>
-                    <p className="mt-1 break-all font-mono text-[11px] text-foreground">
-                      {codexBinaryPath || "PATH"}
-                    </p>
-                  </div>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    className="self-start"
-                    onClick={() =>
-                      updateSettings({
-                        codexBinaryPath: defaults.codexBinaryPath,
-                        codexHomePath: defaults.codexHomePath,
-                      })
-                    }
-                  >
-                    Reset codex overrides
-                  </Button>
+            {runtimeConfig.deploymentMode === "local" ? (
+              <section className="rounded-2xl border border-border bg-card p-5">
+                <div className="mb-4">
+                  <h2 className="text-sm font-medium text-foreground">Codex App Server</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    These overrides apply to new sessions and let you use a non-default Codex
+                    install.
+                  </p>
                 </div>
-              </div>
-            </section>
+
+                <div className="space-y-4">
+                  <label htmlFor="codex-binary-path" className="block space-y-1">
+                    <span className="text-xs font-medium text-foreground">Codex binary path</span>
+                    <Input
+                      id="codex-binary-path"
+                      value={codexBinaryPath}
+                      onChange={(event) => updateSettings({ codexBinaryPath: event.target.value })}
+                      placeholder="codex"
+                      spellCheck={false}
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      Leave blank to use <code>codex</code> from your PATH.
+                    </span>
+                  </label>
+
+                  <label htmlFor="codex-home-path" className="block space-y-1">
+                    <span className="text-xs font-medium text-foreground">CODEX_HOME path</span>
+                    <Input
+                      id="codex-home-path"
+                      value={codexHomePath}
+                      onChange={(event) => updateSettings({ codexHomePath: event.target.value })}
+                      placeholder="/Users/you/.codex"
+                      spellCheck={false}
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      Optional custom Codex home/config directory.
+                    </span>
+                  </label>
+
+                  <div className="flex flex-col gap-3 text-xs text-muted-foreground sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0 flex-1">
+                      <p>Binary source</p>
+                      <p className="mt-1 break-all font-mono text-[11px] text-foreground">
+                        {codexBinaryPath || "PATH"}
+                      </p>
+                    </div>
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      className="self-start"
+                      onClick={() =>
+                        updateSettings({
+                          codexBinaryPath: defaults.codexBinaryPath,
+                          codexHomePath: defaults.codexHomePath,
+                        })
+                      }
+                    >
+                      Reset codex overrides
+                    </Button>
+                  </div>
+                </div>
+              </section>
+            ) : null}
 
             <section className="rounded-2xl border border-border bg-card p-5">
               <div className="mb-4">

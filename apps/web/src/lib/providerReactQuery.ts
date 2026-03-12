@@ -1,4 +1,5 @@
 import {
+  type HostedProviderLoginSessionId,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   ThreadId,
@@ -6,6 +7,7 @@ import {
 import { queryOptions } from "@tanstack/react-query";
 import { Option, Schema } from "effect";
 import { ensureNativeApi } from "../nativeApi";
+import { getRuntimePublicConfig } from "../runtimeConfig";
 
 interface CheckpointDiffQueryInput {
   threadId: ThreadId | null;
@@ -17,6 +19,9 @@ interface CheckpointDiffQueryInput {
 
 export const providerQueryKeys = {
   all: ["providers"] as const,
+  accounts: () => ["providers", "accounts"] as const,
+  loginSession: (sessionId: HostedProviderLoginSessionId | null) =>
+    ["providers", "loginSession", sessionId] as const,
   checkpointDiff: (input: CheckpointDiffQueryInput) =>
     [
       "providers",
@@ -120,5 +125,42 @@ export function checkpointDiffQueryOptions(input: CheckpointDiffQueryInput) {
       isCheckpointTemporarilyUnavailable(error)
         ? Math.min(5_000, 250 * 2 ** (attempt - 1))
         : Math.min(1_000, 100 * 2 ** (attempt - 1)),
+  });
+}
+
+export function hostedProviderAccountsQueryOptions(enabled = true) {
+  const runtimeConfig = getRuntimePublicConfig();
+  return queryOptions({
+    queryKey: providerQueryKeys.accounts(),
+    queryFn: async () => {
+      const api = ensureNativeApi();
+      return api.providers.list();
+    },
+    enabled: enabled && runtimeConfig.deploymentMode === "self-hosted",
+    staleTime: 5_000,
+  });
+}
+
+export function hostedProviderLoginSessionQueryOptions(
+  sessionId: HostedProviderLoginSessionId | null,
+  enabled = true,
+) {
+  const runtimeConfig = getRuntimePublicConfig();
+  return queryOptions({
+    queryKey: providerQueryKeys.loginSession(sessionId),
+    queryFn: async () => {
+      if (!sessionId) {
+        throw new Error("Provider login session is unavailable.");
+      }
+      const api = ensureNativeApi();
+      return api.providers.getLoginSession({ sessionId });
+    },
+    enabled:
+      enabled && runtimeConfig.deploymentMode === "self-hosted" && typeof sessionId === "string",
+    staleTime: 1_000,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "pending" || status === "awaiting_user" ? 1_000 : false;
+    },
   });
 }

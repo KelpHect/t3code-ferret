@@ -54,6 +54,7 @@ import {
   HostedProjectSearchEntriesInput,
   HostedProjectWriteFileInput,
   HostedProviderBeginLoginInput,
+  HostedProviderLoginSessionIdInput,
   HostedRunCommandJobInput,
   HostedTerminalProjectOpenInput,
 } from "./hosted";
@@ -112,6 +113,8 @@ export const WS_METHODS = {
   // Providers
   providersList: "providers.list",
   providersBeginLogin: "providers.beginLogin",
+  providersGetLoginSession: "providers.getLoginSession",
+  providersCancelLogin: "providers.cancelLogin",
   providersLogout: "providers.logout",
 
   // Server meta
@@ -205,6 +208,8 @@ const WebSocketRequestBody = Schema.Union([
   // Providers
   tagRequestBody(WS_METHODS.providersList, Schema.Struct({})),
   tagRequestBody(WS_METHODS.providersBeginLogin, HostedProviderBeginLoginInput),
+  tagRequestBody(WS_METHODS.providersGetLoginSession, HostedProviderLoginSessionIdInput),
+  tagRequestBody(WS_METHODS.providersCancelLogin, HostedProviderLoginSessionIdInput),
   tagRequestBody(WS_METHODS.providersLogout, HostedProviderBeginLoginInput),
 
   // Server meta

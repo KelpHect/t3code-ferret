@@ -515,35 +515,115 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
       res.writeHead(statusCode, headers);
       res.end(body);
     };
+    const respondJson = (statusCode: number, payload: unknown) =>
+      respond(
+        statusCode,
+        { "Content-Type": "application/json; charset=utf-8" },
+        JSON.stringify(payload),
+      );
 
     void Effect.runPromise(
       Effect.gen(function* () {
         const url = new URL(req.url ?? "/", `http://localhost:${port}`);
         if (url.pathname === "/api/runtime-config") {
-          respond(
-            200,
-            { "Content-Type": "application/json; charset=utf-8" },
-            JSON.stringify(runtimePublicConfig),
-          );
+          respondJson(200, runtimePublicConfig);
           return;
         }
 
         if (url.pathname === "/health/live") {
-          respond(
-            200,
-            { "Content-Type": "application/json; charset=utf-8" },
-            JSON.stringify({ ok: true }),
-          );
+          respondJson(200, { ok: true });
           return;
         }
 
         if (url.pathname === "/health/ready") {
           const ready = yield* readiness.isServerReady;
-          respond(
-            ready ? 200 : 503,
-            { "Content-Type": "application/json; charset=utf-8" },
-            JSON.stringify({ ok: ready }),
-          );
+          respondJson(ready ? 200 : 503, { ok: ready });
+          return;
+        }
+
+        const providerLoginSessionMatch = url.pathname.match(
+          /^\/api\/providers\/login-sessions\/([^/]+)$/,
+        );
+        if (providerLoginSessionMatch) {
+          if (deploymentMode !== "self-hosted") {
+            respond(404, { "Content-Type": "text/plain; charset=utf-8" }, "Not Found");
+            return;
+          }
+          if (req.method !== "GET") {
+            respond(
+              405,
+              { Allow: "GET", "Content-Type": "text/plain; charset=utf-8" },
+              "Method Not Allowed",
+            );
+            return;
+          }
+          const viewer = yield* Effect.tryPromise({
+            try: () => resolveViewerFromRequest(req, serverConfig),
+            catch: (cause) =>
+              cause instanceof SelfHostedAuthError
+                ? cause
+                : new SelfHostedAuthError(401, "Authentication required."),
+          });
+          if (!viewer) {
+            throw new SelfHostedAuthError(401, "Authentication required.");
+          }
+          const sessionId = decodeURIComponent(providerLoginSessionMatch[1] ?? "");
+          const session = yield* Effect.tryPromise({
+            try: () =>
+              hostedRuntime.getProviderLoginSession(toHostedUser(viewer), {
+                sessionId,
+              }),
+            catch: (cause) =>
+              new RouteRequestError({
+                message:
+                  cause instanceof Error ? cause.message : "Unable to load provider login session.",
+              }),
+          });
+          respondJson(200, session);
+          return;
+        }
+
+        const providerLoginCancelMatch = url.pathname.match(
+          /^\/api\/providers\/login-sessions\/([^/]+)\/cancel$/,
+        );
+        if (providerLoginCancelMatch) {
+          if (deploymentMode !== "self-hosted") {
+            respond(404, { "Content-Type": "text/plain; charset=utf-8" }, "Not Found");
+            return;
+          }
+          if (req.method !== "POST") {
+            respond(
+              405,
+              { Allow: "POST", "Content-Type": "text/plain; charset=utf-8" },
+              "Method Not Allowed",
+            );
+            return;
+          }
+          const viewer = yield* Effect.tryPromise({
+            try: () => resolveViewerFromRequest(req, serverConfig),
+            catch: (cause) =>
+              cause instanceof SelfHostedAuthError
+                ? cause
+                : new SelfHostedAuthError(401, "Authentication required."),
+          });
+          if (!viewer) {
+            throw new SelfHostedAuthError(401, "Authentication required.");
+          }
+          const sessionId = decodeURIComponent(providerLoginCancelMatch[1] ?? "");
+          const result = yield* Effect.tryPromise({
+            try: () =>
+              hostedRuntime.cancelProviderLogin(toHostedUser(viewer), {
+                sessionId,
+              }),
+            catch: (cause) =>
+              new RouteRequestError({
+                message:
+                  cause instanceof Error
+                    ? cause.message
+                    : "Unable to cancel provider login session.",
+              }),
+          });
+          respondJson(200, result);
           return;
         }
 
@@ -690,7 +770,15 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         }
         respond(200, { "Content-Type": contentType }, data);
       }),
-    ).catch(() => {
+    ).catch((error) => {
+      if (error instanceof SelfHostedAuthError) {
+        respond(error.statusCode, { "Content-Type": "text/plain; charset=utf-8" }, error.message);
+        return;
+      }
+      if (error instanceof Error && error.message.toLowerCase().includes("not found")) {
+        respond(404, { "Content-Type": "text/plain; charset=utf-8" }, error.message);
+        return;
+      }
       if (!res.headersSent) {
         respond(500, { "Content-Type": "text/plain" }, "Internal Server Error");
       }
@@ -1453,6 +1541,34 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         );
         return yield* Effect.promise(() =>
           hostedRuntime.beginProviderLogin(providersLoginViewer, providersLoginBody),
+        );
+
+      case WS_METHODS.providersGetLoginSession:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted provider accounts are only available in self-hosted mode.",
+          });
+        }
+        const providersSessionViewer = yield* getHostedViewer(viewer);
+        const providersSessionBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.providersGetLoginSession),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.getProviderLoginSession(providersSessionViewer, providersSessionBody),
+        );
+
+      case WS_METHODS.providersCancelLogin:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted provider accounts are only available in self-hosted mode.",
+          });
+        }
+        const providersCancelViewer = yield* getHostedViewer(viewer);
+        const providersCancelBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.providersCancelLogin),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.cancelProviderLogin(providersCancelViewer, providersCancelBody),
         );
 
       case WS_METHODS.providersLogout:

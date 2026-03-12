@@ -186,6 +186,8 @@ export function createWsNativeApi(): NativeApi {
     providers: {
       list: () => transport.request(WS_METHODS.providersList),
       beginLogin: (input) => transport.request(WS_METHODS.providersBeginLogin, input),
+      getLoginSession: (input) => transport.request(WS_METHODS.providersGetLoginSession, input),
+      cancelLogin: (input) => transport.request(WS_METHODS.providersCancelLogin, input),
       logout: (input) => transport.request(WS_METHODS.providersLogout, input),
     },
     orchestration: {

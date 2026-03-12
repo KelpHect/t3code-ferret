@@ -54,6 +54,14 @@ import { GitCommandError, GitManagerError } from "./git/Errors.ts";
 import { MigrationError } from "@effect/sql-sqlite-bun/SqliteMigrator";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService.ts";
 
+const { verifyTokenMock } = vi.hoisted(() => ({
+  verifyTokenMock: vi.fn(),
+}));
+
+vi.mock("@clerk/backend", () => ({
+  verifyToken: verifyTokenMock,
+}));
+
 const asEventId = (value: string): EventId => EventId.makeUnsafe(value);
 const asProviderItemId = (value: string): ProviderItemId => ProviderItemId.makeUnsafe(value);
 const asThreadId = (value: string): ThreadId => ThreadId.makeUnsafe(value);
@@ -401,6 +409,10 @@ async function rewriteKeybindingsAndWaitForPush(
 async function requestPath(
   port: number,
   requestPath: string,
+  options: {
+    method?: string;
+    headers?: Record<string, string>;
+  } = {},
 ): Promise<{ statusCode: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = Http.request(
@@ -408,7 +420,8 @@ async function requestPath(
         hostname: "127.0.0.1",
         port,
         path: requestPath,
-        method: "GET",
+        method: options.method ?? "GET",
+        headers: options.headers,
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -494,6 +507,24 @@ describe("WebSocket Server", () => {
     return dir;
   }
 
+  async function reservePort(): Promise<number> {
+    return await new Promise((resolve, reject) => {
+      const candidate = Http.createServer();
+      candidate.once("error", reject);
+      candidate.listen(0, "127.0.0.1", () => {
+        const address = candidate.address();
+        const port = typeof address === "object" && address !== null ? address.port : 0;
+        candidate.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(port);
+        });
+      });
+    });
+  }
+
   async function createTestServer(
     options: {
       persistenceLayer?: Layer.Layer<
@@ -512,6 +543,7 @@ describe("WebSocket Server", () => {
       gitManager?: GitManagerShape;
       gitCore?: Pick<GitCoreShape, "listBranches" | "initRepo" | "pullCurrentBranch">;
       terminalManager?: TerminalManagerShape;
+      serverConfigOverrides?: Partial<ServerConfigShape>;
     } = {},
   ): Promise<Http.Server> {
     if (serverScope) {
@@ -547,6 +579,7 @@ describe("WebSocket Server", () => {
       publicBaseUrl: undefined,
       autoBootstrapProjectFromCwd: options.autoBootstrapProjectFromCwd ?? false,
       logWebSocketEvents: options.logWebSocketEvents ?? Boolean(options.devUrl),
+      ...options.serverConfigOverrides,
     } satisfies ServerConfigShape);
     const infrastructureLayer = providerLayer.pipe(Layer.provideMerge(persistenceLayer));
     const runtimeOverrides = Layer.mergeAll(
@@ -608,6 +641,7 @@ describe("WebSocket Server", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
     vi.restoreAllMocks();
+    verifyTokenMock.mockReset();
   });
 
   it("sends welcome message on connect", async () => {
@@ -683,6 +717,66 @@ describe("WebSocket Server", () => {
     const response = await fetch(`http://127.0.0.1:${port}/`);
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("static-root");
+  });
+
+  it("protects provider login session bridge endpoints in self-hosted mode", async () => {
+    const port = await reservePort();
+    const origin = `http://127.0.0.1:${port}`;
+    verifyTokenMock.mockResolvedValue({
+      sub: "user-self-hosted",
+      email: "user@example.com",
+      name: "Self Hosted User",
+    });
+
+    server = await createTestServer({
+      cwd: "/test/project",
+      serverConfigOverrides: {
+        deploymentMode: "self-hosted",
+        port,
+        clerkSecretKey: "sk_test_hosted",
+        clerkPublishableKey: "pk_test_hosted",
+        publicBaseUrl: new URL(origin),
+      },
+    });
+
+    const unauthenticated = await requestPath(port, "/api/providers/login-sessions/missing", {
+      headers: {
+        Origin: origin,
+      },
+    });
+    expect(unauthenticated.statusCode).toBe(401);
+    expect(unauthenticated.body).toContain("Authentication required.");
+
+    const notFound = await requestPath(port, "/api/providers/login-sessions/missing", {
+      headers: {
+        Origin: origin,
+        Cookie: "__session=test-session",
+      },
+    });
+    expect(notFound.statusCode).toBe(404);
+    expect(notFound.body).toContain("Provider login session not found");
+
+    const methodNotAllowed = await requestPath(
+      port,
+      "/api/providers/login-sessions/missing/cancel",
+      {
+        headers: {
+          Origin: origin,
+          Cookie: "__session=test-session",
+        },
+      },
+    );
+    expect(methodNotAllowed.statusCode).toBe(405);
+
+    const cancelNotFound = await requestPath(port, "/api/providers/login-sessions/missing/cancel", {
+      method: "POST",
+      headers: {
+        Origin: origin,
+        Cookie: "__session=test-session",
+      },
+    });
+    expect(cancelNotFound.statusCode).toBe(404);
+    expect(cancelNotFound.body).toContain("Provider login session not found");
   });
 
   it("rejects static path traversal attempts", async () => {
