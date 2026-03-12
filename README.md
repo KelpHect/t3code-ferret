@@ -21,6 +21,10 @@ We are very very early in this project. Expect bugs.
 
 We are not accepting contributions yet.
 
+## Self-hosted staging
+
+Self-hosted Coolify deployment files and the staging checklist live in [docs/self-hosted-coolify.md](./docs/self-hosted-coolify.md).
+
 ## If you REALLY want to contribute still.... read this first
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening an issue or PR.

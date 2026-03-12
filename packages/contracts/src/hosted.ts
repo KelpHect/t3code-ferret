@@ -2,6 +2,7 @@ import { Schema } from "effect";
 import {
   IsoDateTime,
   JobId,
+  MessageId,
   PositiveInt,
   ProjectId,
   ThreadId,
@@ -105,6 +106,11 @@ export const HostedProjectIdInput = Schema.Struct({
   projectId: ProjectId,
 });
 export type HostedProjectIdInput = typeof HostedProjectIdInput.Type;
+
+export const HostedProjectDeleteResult = Schema.Struct({
+  projectId: ProjectId,
+});
+export type HostedProjectDeleteResult = typeof HostedProjectDeleteResult.Type;
 
 export const HostedProjectCreateResult = Schema.Struct({
   project: HostedProject,
@@ -299,12 +305,14 @@ export type HostedRunCommandJobInput = typeof HostedRunCommandJobInput.Type;
 export const HostedAgentPromptJobInput = Schema.Struct({
   projectId: ProjectId,
   threadId: ThreadId,
+  messageId: MessageId,
   prompt: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(120_000)),
   model: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(255))),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(() => DEFAULT_RUNTIME_MODE)),
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(() => DEFAULT_PROVIDER_INTERACTION_MODE),
   ),
+  createdAt: IsoDateTime,
 });
 export type HostedAgentPromptJobInput = typeof HostedAgentPromptJobInput.Type;
 

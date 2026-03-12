@@ -1338,6 +1338,16 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           hostedRuntime.archiveProject(archiveViewer, archiveBody),
         );
 
+      case WS_METHODS.projectsDelete:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted projects are only available in self-hosted mode.",
+          });
+        }
+        const deleteViewer = yield* getHostedViewer(viewer);
+        const deleteBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.projectsDelete));
+        return yield* Effect.promise(() => hostedRuntime.deleteProject(deleteViewer, deleteBody));
+
       case WS_METHODS.projectsFilesList:
         if (deploymentMode !== "self-hosted") {
           return yield* new RouteRequestError({
@@ -1492,6 +1502,18 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           hostedRuntime.listJobEvents(jobsEventsViewer, jobsEventsBody),
         );
 
+      case WS_METHODS.jobsCancel:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted jobs are only available in self-hosted mode.",
+          });
+        }
+        const jobsCancelViewer = yield* getHostedViewer(viewer);
+        const jobsCancelBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.jobsCancel));
+        return yield* Effect.promise(() =>
+          hostedRuntime.cancelJob(jobsCancelViewer, jobsCancelBody),
+        );
+
       case WS_METHODS.jobsRunCommand:
         if (deploymentMode !== "self-hosted") {
           return yield* new RouteRequestError({
@@ -1516,6 +1538,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         const jobsAgentPromptBody = stripRequestTag(
           requestBodyForTag(request, WS_METHODS.jobsAgentPrompt),
         );
+        yield* assertViewerOwnsThread(jobsAgentPromptViewer, jobsAgentPromptBody.threadId);
         return yield* Effect.promise(() =>
           hostedRuntime.agentPrompt(jobsAgentPromptViewer, jobsAgentPromptBody),
         );

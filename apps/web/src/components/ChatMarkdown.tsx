@@ -1,8 +1,4 @@
-import {
-  getSharedHighlighter,
-  type DiffsHighlighter,
-  type SupportedLanguages,
-} from "@pierre/diffs";
+import type { DiffsHighlighter, SupportedLanguages } from "@pierre/diffs";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import React, {
   Children,
@@ -118,19 +114,23 @@ function getHighlighterPromise(language: string): Promise<DiffsHighlighter> {
   const cached = highlighterPromiseCache.get(language);
   if (cached) return cached;
 
-  const promise = getSharedHighlighter({
-    themes: [resolveDiffThemeName("dark"), resolveDiffThemeName("light")],
-    langs: [language as SupportedLanguages],
-    preferredHighlighter: "shiki-js",
-  }).catch((err) => {
-    highlighterPromiseCache.delete(language);
-    if (language === "text") {
-      // "text" itself failed — Shiki cannot initialize at all, surface the error
-      throw err;
-    }
-    // Language not supported by Shiki — fall back to "text"
-    return getHighlighterPromise("text");
-  });
+  const promise = import("@pierre/diffs")
+    .then(({ getSharedHighlighter }) =>
+      getSharedHighlighter({
+        themes: [resolveDiffThemeName("dark"), resolveDiffThemeName("light")],
+        langs: [language as SupportedLanguages],
+        preferredHighlighter: "shiki-js",
+      }),
+    )
+    .catch((err) => {
+      highlighterPromiseCache.delete(language);
+      if (language === "text") {
+        // "text" itself failed — Shiki cannot initialize at all, surface the error
+        throw err;
+      }
+      // Language not supported by Shiki — fall back to "text"
+      return getHighlighterPromise("text");
+    });
   highlighterPromiseCache.set(language, promise);
   return promise;
 }

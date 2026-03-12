@@ -1,8 +1,7 @@
 import { ThreadId } from "@t3tools/contracts";
 import { createFileRoute, retainSearchParams, useNavigate } from "@tanstack/react-router";
-import { Suspense, lazy, type ReactNode, useCallback, useEffect } from "react";
+import { Suspense, lazy, type ComponentProps, type ReactNode, useCallback, useEffect } from "react";
 
-import ChatView from "../components/ChatView";
 import { useComposerDraftStore } from "../composerDraftStore";
 import {
   type DiffRouteSearch,
@@ -14,7 +13,35 @@ import { useStore } from "../store";
 import { Sheet, SheetPopup } from "../components/ui/sheet";
 import { Sidebar, SidebarInset, SidebarProvider, SidebarRail } from "~/components/ui/sidebar";
 
-const DiffPanel = lazy(() => import("../components/DiffPanel"));
+const loadChatView = () => import("../components/ChatView");
+const loadDiffPanelModule = () => import("../components/DiffPanel");
+type DiffPanelModule = Awaited<ReturnType<typeof loadDiffPanelModule>>;
+
+let cachedDiffPanelModule: DiffPanelModule | null = null;
+
+function DiffPanelWithWorkerPool(props: ComponentProps<DiffPanelModule["default"]>) {
+  const module = cachedDiffPanelModule;
+  if (!module) {
+    return null;
+  }
+
+  return (
+    <module.DiffWorkerPoolProvider>
+      <module.default {...props} />
+    </module.DiffWorkerPoolProvider>
+  );
+}
+
+const ChatView = lazy(loadChatView);
+const DiffPanel = lazy(async () => {
+  const module = await loadDiffPanelModule();
+  cachedDiffPanelModule = module;
+  return {
+    default: DiffPanelWithWorkerPool,
+  };
+});
+
+void loadChatView();
 const DIFF_INLINE_LAYOUT_MEDIA_QUERY = "(max-width: 1180px)";
 const DIFF_INLINE_SIDEBAR_WIDTH_STORAGE_KEY = "chat_diff_sidebar_width";
 const DIFF_INLINE_DEFAULT_WIDTH = "clamp(28rem,48vw,44rem)";
@@ -60,6 +87,14 @@ const DiffLoadingFallback = (props: { inline: boolean }) => {
     <aside className="flex h-full w-[560px] shrink-0 items-center justify-center border-l border-border bg-card px-4 text-center text-xs text-muted-foreground/70">
       Loading diff viewer...
     </aside>
+  );
+};
+
+const ChatLoadingFallback = () => {
+  return (
+    <div className="flex h-full min-h-0 items-center justify-center px-4 text-center text-xs text-muted-foreground/70">
+      Loading chat...
+    </div>
   );
 };
 
@@ -205,7 +240,9 @@ function ChatThreadRouteView() {
     return (
       <>
         <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
-          <ChatView key={threadId} threadId={threadId} />
+          <Suspense fallback={<ChatLoadingFallback />}>
+            <ChatView key={threadId} threadId={threadId} />
+          </Suspense>
         </SidebarInset>
         <DiffPanelInlineSidebar diffOpen={diffOpen} onCloseDiff={closeDiff} onOpenDiff={openDiff} />
       </>
@@ -215,7 +252,9 @@ function ChatThreadRouteView() {
   return (
     <>
       <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
-        <ChatView key={threadId} threadId={threadId} />
+        <Suspense fallback={<ChatLoadingFallback />}>
+          <ChatView key={threadId} threadId={threadId} />
+        </Suspense>
       </SidebarInset>
       <DiffPanelSheet diffOpen={diffOpen} onCloseDiff={closeDiff}>
         <Suspense fallback={<DiffLoadingFallback inline={false} />}>

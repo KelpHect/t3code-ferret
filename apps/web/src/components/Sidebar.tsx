@@ -280,6 +280,7 @@ export default function Sidebar() {
   );
   const navigate = useNavigate();
   const isOnSettings = useLocation({ select: (loc) => loc.pathname === "/settings" });
+  const isOnJobs = useLocation({ select: (loc) => loc.pathname === "/jobs" });
   const { settings: appSettings } = useAppSettings();
   const runtimeConfig = useRuntimePublicConfig();
   const isSelfHosted = runtimeConfig.deploymentMode === "self-hosted";
@@ -994,11 +995,15 @@ export default function Sidebar() {
           clearComposerDraftForThread(projectDraftThread.threadId);
         }
         clearProjectDraftThreadId(projectId);
-        await api.orchestration.dispatchCommand({
-          type: "project.delete",
-          commandId: newCommandId(),
-          projectId,
-        });
+        if (isSelfHosted) {
+          await api.projects.delete({ projectId });
+        } else {
+          await api.orchestration.dispatchCommand({
+            type: "project.delete",
+            commandId: newCommandId(),
+            projectId,
+          });
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error deleting project.";
         console.error("Failed to remove project", { projectId, error });
@@ -1013,6 +1018,7 @@ export default function Sidebar() {
       clearComposerDraftForThread,
       clearProjectDraftThreadId,
       getDraftThreadByProjectId,
+      isSelfHosted,
       projects,
       threads,
     ],
@@ -1849,8 +1855,20 @@ export default function Sidebar() {
       <SidebarSeparator />
       <SidebarFooter className="p-2">
         <SidebarMenu>
+          {isSelfHosted && !isOnJobs && !isOnSettings ? (
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                size="sm"
+                className="gap-2 px-2 py-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"
+                onClick={() => void navigate({ to: "/jobs", search: {} })}
+              >
+                <RocketIcon className="size-3.5" />
+                <span className="text-xs">Jobs</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ) : null}
           <SidebarMenuItem>
-            {isOnSettings ? (
+            {isOnSettings || isOnJobs ? (
               <SidebarMenuButton
                 size="sm"
                 className="gap-2 px-2 py-1.5 text-muted-foreground/70 hover:bg-accent hover:text-foreground"

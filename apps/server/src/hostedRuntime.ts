@@ -5,8 +5,11 @@ import type { Readable, Writable } from "node:stream";
 
 import {
   CommandId,
+  EventId,
   JobId,
+  MessageId,
   ProjectId,
+  TurnId,
   type HostedGitBranchesResult,
   type HostedGitCommitListInput,
   type HostedGitCommitListResult,
@@ -24,6 +27,7 @@ import {
   type HostedProject,
   type HostedProjectCreateInput,
   type HostedProjectCreateResult,
+  type HostedProjectDeleteResult,
   type HostedProjectFileListInput,
   type HostedProjectFileListResult,
   type HostedProjectFileReadInput,
@@ -41,6 +45,7 @@ import {
   type HostedProviderListResult,
   type HostedProviderLogoutResult,
   type HostedRunCommandJobInput,
+  type OrchestrationSession,
   type HostedTerminalProjectOpenInput,
   type ProjectSearchEntriesResult,
   type ProviderKind,
@@ -131,6 +136,12 @@ interface ProviderLoginSessionRecord extends HostedProviderLoginSession {
 interface ProviderLoginProcessEntry {
   readonly child: ReturnType<typeof spawn>;
   suppressFinalize: boolean;
+}
+
+interface HostedJobExecutionControl {
+  child: StreamingChildProcess | null;
+  cancelRequestedAt: string | null;
+  cancelSummary: string | null;
 }
 
 type StreamingChildProcess = ReturnType<typeof spawn> & {
@@ -233,6 +244,26 @@ type StreamingProcessResult = {
   readonly stderrTruncated: boolean;
 };
 
+type AgentPromptJobExecutionInput = Pick<
+  HostedAgentPromptJobInput,
+  "prompt" | "model" | "runtimeMode" | "interactionMode"
+>;
+
+interface HostedAgentRecoveryContext {
+  readonly sessionId: string;
+  readonly recoveredAt: string;
+}
+
+type HostedRecoveryAction = "interrupt-non-resumable" | "restart-queued" | "resume-session";
+
+function hostedTurnIdForJob(jobId: HostedJob["id"]): TurnId {
+  return TurnId.makeUnsafe(`hosted-turn:${jobId}`);
+}
+
+function hostedAssistantMessageIdForJob(jobId: HostedJob["id"]): MessageId {
+  return MessageId.makeUnsafe(`assistant:hosted-job:${jobId}`);
+}
+
 function toHostedProjectRow(value: Record<string, unknown>): HostedProject {
   return {
     id: value.id as HostedProject["id"],
@@ -326,12 +357,57 @@ function toProviderLoginSessionRecord(value: Record<string, unknown>): ProviderL
   };
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function readHostedAgentSessionIdFromValue(value: unknown): string | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+  const directCandidate =
+    typeof record.codexSessionId === "string"
+      ? record.codexSessionId
+      : typeof record.sessionId === "string"
+        ? record.sessionId
+        : null;
+  if (directCandidate && directCandidate.length > 0) {
+    return directCandidate;
+  }
+  const recovery = asRecord(record.recovery);
+  const recoveryCandidate = typeof recovery?.sessionId === "string" ? recovery.sessionId : null;
+  return recoveryCandidate && recoveryCandidate.length > 0 ? recoveryCandidate : null;
+}
+
+function readCodexExecThreadIdFromJsonLine(line: string): string | null {
+  try {
+    const parsed = JSON.parse(line) as {
+      readonly type?: unknown;
+      readonly thread_id?: unknown;
+    };
+    return parsed.type === "thread.started" && typeof parsed.thread_id === "string"
+      ? parsed.thread_id
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export class HostedRuntime {
   private readonly projectMutationLocks = new Map<string, Promise<void>>();
   private readonly jobEventLocks = new Map<string, Promise<void>>();
   private readonly providerLoginLocks = new Map<string, Promise<void>>();
   private readonly backgroundJobs = new Map<string, Promise<void>>();
+  private readonly jobExecutionControls = new Map<string, HostedJobExecutionControl>();
   private readonly providerLoginProcesses = new Map<string, ProviderLoginProcessEntry>();
+  private readonly deletedProjectOwners = new Map<
+    HostedProject["id"],
+    { ownerClerkUserId: string; expiresAt: number }
+  >();
 
   constructor(private readonly options: HostedRuntimeOptions) {}
 
@@ -392,7 +468,13 @@ export class HostedRuntime {
       WHERE project_id = ${projectId}
       LIMIT 1
     `)) as Array<Record<string, unknown>>;
-    return rows.length > 0 ? String(rows[0]?.ownerClerkUserId ?? "") : null;
+    if (rows.length > 0) {
+      return String(rows[0]?.ownerClerkUserId ?? "");
+    }
+    const rememberedOwner = this.readRememberedDeletedProjectOwner(
+      projectId as HostedProject["id"],
+    );
+    return rememberedOwner;
   }
 
   async createProject(
@@ -495,6 +577,73 @@ export class HostedRuntime {
         AND owner_clerk_user_id = ${user.userId}
     `);
     return this.getProject(user, input);
+  }
+
+  async deleteProject(
+    user: HostedUser,
+    input: HostedProjectIdInput,
+  ): Promise<HostedProjectDeleteResult> {
+    const project = await this.getProject(user, input);
+    await this.runProjectExclusive(project.id, async () => {
+      const current = await this.getOwnedProject(user.userId, project.id);
+      if (!current) {
+        return;
+      }
+
+      const activeJobs = await this.listActiveProjectJobs(project.id, user.userId);
+
+      for (const job of activeJobs) {
+        await this.cancelJob(user, { jobId: job.id }).catch(() => undefined);
+      }
+
+      await Promise.all(
+        activeJobs.map(async (job) => {
+          await this.backgroundJobs.get(job.id)?.catch(() => undefined);
+        }),
+      );
+
+      await this.options
+        .runEffect(
+          this.options.terminalManager.close({
+            threadId: `project:${project.id}`,
+            deleteHistory: true,
+          }),
+        )
+        .catch(() => undefined);
+
+      this.rememberDeletedProjectOwner(project.id, user.userId);
+      await this.dispatchOrchestrationCommand({
+        type: "project.delete",
+        commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+        projectId: project.id,
+      });
+
+      await this.options.runEffect(this.options.sql`
+        DELETE FROM job_events
+        WHERE job_id IN (
+          SELECT job_id
+          FROM jobs
+          WHERE project_id = ${project.id}
+            AND owner_clerk_user_id = ${user.userId}
+        )
+      `);
+      await this.options.runEffect(this.options.sql`
+        DELETE FROM jobs
+        WHERE project_id = ${project.id}
+          AND owner_clerk_user_id = ${user.userId}
+      `);
+      await this.options.runEffect(this.options.sql`
+        DELETE FROM hosted_projects
+        WHERE project_id = ${project.id}
+          AND owner_clerk_user_id = ${user.userId}
+      `);
+      clearWorkspaceIndexCache(project.repoPath);
+      await fs.rm(project.storageRoot, { recursive: true, force: true });
+    });
+
+    return {
+      projectId: project.id,
+    };
   }
 
   async listProjectFiles(
@@ -646,6 +795,35 @@ export class HostedRuntime {
     };
   }
 
+  async cancelJob(user: HostedUser, input: HostedJobIdInput): Promise<HostedJob> {
+    const job = await this.getJob(user, input);
+    if (this.isHostedJobTerminal(job.status)) {
+      return job;
+    }
+
+    const cancelledAt = nowIso();
+    const cancelSummary = this.jobCancellationSummary(job);
+    const control = this.jobExecutionControls.get(job.id);
+    if (control) {
+      control.cancelRequestedAt = cancelledAt;
+      control.cancelSummary = cancelSummary;
+    }
+
+    const activeChild = control?.child ?? null;
+    if (activeChild) {
+      const closePromise = new Promise<void>((resolve) => {
+        activeChild.once("close", () => resolve());
+      });
+      killChild(activeChild);
+      await Promise.race([
+        closePromise,
+        new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+      ]);
+    }
+
+    return this.finalizeCancelledJob(job.id);
+  }
+
   async runCommand(user: HostedUser, input: HostedRunCommandJobInput): Promise<HostedJob> {
     const project = await this.getProject(user, { projectId: input.projectId });
     const title = input.title ?? summarizeText(input.command, "Run command");
@@ -688,11 +866,41 @@ export class HostedRuntime {
         model: input.model ?? null,
         runtimeMode: input.runtimeMode,
         interactionMode: input.interactionMode,
+        messageId: input.messageId,
+        createdAt: input.createdAt,
       },
     });
+    const turnId = hostedTurnIdForJob(job.id);
+    try {
+      await this.startHostedAgentThreadTurn({
+        threadId: input.threadId,
+        turnId,
+        messageId: input.messageId,
+        prompt: input.prompt,
+        runtimeMode: input.runtimeMode,
+        createdAt: input.createdAt,
+      });
+    } catch (error) {
+      const failureSummary = summarizeText(
+        error instanceof Error ? error.message : String(error),
+        "Failed to initialize hosted chat turn.",
+      );
+      await this.updateJobRecord(job.id, {
+        status: "failed",
+        finishedAt: nowIso(),
+        resultSummary: failureSummary,
+      });
+      await this.appendJobEvent({
+        ownerClerkUserId: project.ownerClerkUserId,
+        jobId: job.id,
+        type: "error",
+        message: failureSummary,
+      });
+      throw error;
+    }
     this.scheduleBackgroundJob(job.id, () =>
       this.runProjectExclusive(project.id, () =>
-        this.runAgentPromptJob(project, job.id, input, providerHome),
+        this.runAgentPromptJob(project, job.id, input, providerHome, input.threadId),
       ),
     );
     return job;
@@ -1041,6 +1249,12 @@ export class HostedRuntime {
       return;
     }
 
+    this.jobExecutionControls.set(jobId, {
+      child: null,
+      cancelRequestedAt: null,
+      cancelSummary: null,
+    });
+
     const running = operation()
       .catch((error) => {
         console.error("hosted background job failed", {
@@ -1052,9 +1266,32 @@ export class HostedRuntime {
         if (this.backgroundJobs.get(jobId) === running) {
           this.backgroundJobs.delete(jobId);
         }
+        this.jobExecutionControls.delete(jobId);
       });
 
     this.backgroundJobs.set(jobId, running);
+  }
+
+  private isHostedJobTerminal(status: HostedJob["status"]): boolean {
+    return (
+      status === "completed" ||
+      status === "failed" ||
+      status === "cancelled" ||
+      status === "interrupted"
+    );
+  }
+
+  private jobCancellationSummary(job: HostedJob): string {
+    switch (job.kind) {
+      case "agent_prompt":
+        return "Hosted agent job cancelled by user.";
+      case "clone_repo":
+        return "Repository clone cancelled by user.";
+      case "command":
+        return "Command cancelled by user.";
+      default:
+        return "Hosted job cancelled by user.";
+    }
   }
 
   private async recoverPendingJobs(): Promise<void> {
@@ -1084,13 +1321,13 @@ export class HostedRuntime {
     `)) as Array<Record<string, unknown>>;
 
     const jobs = rows.map(toHostedJobRow);
-    const interruptedAt = nowIso();
+    const recoveredAt = nowIso();
     for (const job of jobs) {
       if (job.status === "queued") {
         await this.recoverQueuedJob(job);
         continue;
       }
-      await this.interruptRecoveredJob(job, interruptedAt);
+      await this.recoverInFlightJob(job, recoveredAt);
     }
   }
 
@@ -1184,13 +1421,8 @@ export class HostedRuntime {
       }
       case "agent_prompt": {
         const project = await this.getProjectRecord(job.projectId);
-        const payload = (job.inputJson ?? {}) as Partial<HostedAgentPromptJobInput>;
-        if (
-          !project ||
-          typeof payload.prompt !== "string" ||
-          payload.prompt.length === 0 ||
-          !job.threadId
-        ) {
+        const recoveredInput = this.decodeRecoveredAgentPromptInput(job.inputJson);
+        if (!project || !recoveredInput || !job.threadId) {
           await this.interruptRecoveredJob(
             job,
             nowIso(),
@@ -1200,14 +1432,7 @@ export class HostedRuntime {
         }
         let providerHome: string;
         try {
-          providerHome = await this.requireAuthenticatedProviderHome(
-            {
-              userId: job.ownerClerkUserId,
-              email: null,
-              displayName: null,
-            },
-            "codex",
-          );
+          providerHome = await this.requireRecoveredAgentProviderHome(job);
         } catch {
           await this.interruptRecoveredJob(
             job,
@@ -1216,29 +1441,127 @@ export class HostedRuntime {
           );
           return;
         }
-        const recoveredInput: HostedAgentPromptJobInput = {
-          projectId: project.id,
-          threadId: job.threadId,
-          prompt: payload.prompt,
-          ...(typeof payload.model === "string" ? { model: payload.model } : {}),
-          runtimeMode:
-            payload.runtimeMode === "approval-required" || payload.runtimeMode === "full-access"
-              ? payload.runtimeMode
-              : "approval-required",
-          interactionMode:
-            payload.interactionMode === "plan" || payload.interactionMode === "default"
-              ? payload.interactionMode
-              : "default",
-        };
         this.scheduleBackgroundJob(job.id, () =>
           this.runProjectExclusive(project.id, () =>
-            this.runAgentPromptJob(project, job.id, recoveredInput, providerHome),
+            this.runAgentPromptJob(project, job.id, recoveredInput, providerHome, job.threadId),
           ),
         );
         return;
       }
       default:
         await this.interruptRecoveredJob(job, nowIso());
+    }
+  }
+
+  private async recoverInFlightJob(job: HostedJob, recoveredAt: string): Promise<void> {
+    switch (job.kind) {
+      case "clone_repo": {
+        const project = await this.getProjectRecord(job.projectId);
+        if (!project) {
+          await this.interruptRecoveredJob(
+            job,
+            recoveredAt,
+            "Running clone job could not be recovered.",
+          );
+          return;
+        }
+        await this.updateProjectRuntimeStatus(project.id, "error", recoveredAt);
+        await this.interruptRecoveredJob(
+          job,
+          recoveredAt,
+          "Server restarted while cloning. Git clone jobs cannot resume mid-transfer; retry the clone.",
+        );
+        return;
+      }
+      case "command": {
+        if (!(await this.getProjectRecord(job.projectId)) || !job.command) {
+          await this.interruptRecoveredJob(
+            job,
+            recoveredAt,
+            "Running command job could not be recovered.",
+          );
+          return;
+        }
+        await this.interruptRecoveredJob(
+          job,
+          recoveredAt,
+          "Server restarted while a command was running. Shell command jobs cannot resume after restart.",
+        );
+        return;
+      }
+      case "agent_prompt": {
+        const project = await this.getProjectRecord(job.projectId);
+        const recoveredInput = this.decodeRecoveredAgentPromptInput(job.inputJson);
+        if (!project || !recoveredInput || !job.threadId) {
+          await this.interruptRecoveredJob(
+            job,
+            recoveredAt,
+            "Running agent job could not be recovered.",
+          );
+          return;
+        }
+
+        let providerHome: string;
+        try {
+          providerHome = await this.requireRecoveredAgentProviderHome(job);
+        } catch {
+          await this.interruptRecoveredJob(
+            job,
+            recoveredAt,
+            "Running agent job could not be recovered because the provider account is not authenticated.",
+          );
+          return;
+        }
+
+        const sessionId = await this.readHostedAgentSessionId(job);
+        if (!sessionId) {
+          await this.interruptRecoveredJob(
+            job,
+            recoveredAt,
+            "Server restarted while Codex was running, but no persisted Codex session id was available to resume.",
+          );
+          return;
+        }
+
+        await this.prepareJobForRecovery(job, recoveredAt, {
+          message:
+            "Server restarted while Codex was running. Resuming the persisted Codex session.",
+          recoveryAction: "resume-session",
+          resultJson: {
+            codexSessionId: sessionId,
+            recovery: {
+              sessionId,
+              recoveredAt,
+              strategy: "resume-session",
+            },
+          },
+        });
+        await this.dispatchOrchestrationCommand({
+          type: "thread.session.set",
+          commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+          threadId: job.threadId,
+          session: this.hostedAgentThreadSession({
+            threadId: job.threadId,
+            runtimeMode: recoveredInput.runtimeMode,
+            status: "running",
+            activeTurnId: hostedTurnIdForJob(job.id),
+            lastError: null,
+            updatedAt: recoveredAt,
+          }),
+          createdAt: recoveredAt,
+        });
+        this.scheduleBackgroundJob(job.id, () =>
+          this.runProjectExclusive(project.id, () =>
+            this.runAgentPromptJob(project, job.id, recoveredInput, providerHome, job.threadId, {
+              sessionId,
+              recoveredAt,
+            }),
+          ),
+        );
+        return;
+      }
+      default:
+        await this.interruptRecoveredJob(job, recoveredAt);
     }
   }
 
@@ -1260,8 +1583,483 @@ export class HostedRuntime {
       message: summary,
       payload: {
         restartRecovered: true,
+        recoveredAfterRestart: true,
+        recoveryAction: "interrupt-non-resumable",
       },
     });
+    if (job.kind === "agent_prompt" && job.threadId) {
+      await this.finalizeHostedAgentThreadTurnFailure({
+        threadId: job.threadId,
+        jobId: job.id,
+        runtimeMode: this.readRuntimeModeFromUnknown(job.inputJson),
+        summary,
+        completedAt: interruptedAt,
+      });
+    }
+  }
+
+  private readRuntimeModeFromUnknown(value: unknown): RuntimeMode {
+    const candidate =
+      value && typeof value === "object" ? (value as { runtimeMode?: unknown }).runtimeMode : null;
+    return candidate === "approval-required" || candidate === "full-access"
+      ? candidate
+      : "approval-required";
+  }
+
+  private decodeRecoveredAgentPromptInput(value: unknown): AgentPromptJobExecutionInput | null {
+    const payload = value && typeof value === "object" ? value : null;
+    const prompt =
+      payload && typeof (payload as { prompt?: unknown }).prompt === "string"
+        ? (payload as { prompt: string }).prompt
+        : null;
+    if (!prompt || prompt.length === 0) {
+      return null;
+    }
+
+    const model =
+      payload && typeof (payload as { model?: unknown }).model === "string"
+        ? (payload as { model: string }).model
+        : undefined;
+    const runtimeMode = this.readRuntimeModeFromUnknown(payload);
+    const interactionMode =
+      payload &&
+      ((payload as { interactionMode?: unknown }).interactionMode === "plan" ||
+        (payload as { interactionMode?: unknown }).interactionMode === "default")
+        ? (payload as { interactionMode: AgentPromptJobExecutionInput["interactionMode"] })
+            .interactionMode
+        : "default";
+
+    return {
+      prompt,
+      ...(model ? { model } : {}),
+      runtimeMode,
+      interactionMode,
+    };
+  }
+
+  private async readHostedAgentSessionId(job: HostedJob): Promise<string | null> {
+    const direct = readHostedAgentSessionIdFromValue(job.resultJson);
+    if (direct) {
+      return direct;
+    }
+
+    const rows = (await this.options.runEffect(this.options.sql`
+      SELECT chunk
+      FROM job_events
+      WHERE job_id = ${job.id}
+        AND type = 'stdout'
+        AND chunk IS NOT NULL
+      ORDER BY seq ASC
+    `)) as Array<Record<string, unknown>>;
+
+    let buffer = "";
+    for (const row of rows) {
+      const chunk = typeof row.chunk === "string" ? row.chunk : "";
+      if (!chunk) {
+        continue;
+      }
+      buffer = `${buffer}${chunk}`;
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+        buffer = buffer.slice(newlineIndex + 1);
+        const sessionId = readCodexExecThreadIdFromJsonLine(line);
+        if (sessionId) {
+          return sessionId;
+        }
+        newlineIndex = buffer.indexOf("\n");
+      }
+    }
+
+    return buffer.length > 0 ? readCodexExecThreadIdFromJsonLine(buffer.replace(/\r$/, "")) : null;
+  }
+
+  private requireRecoveredAgentProviderHome(job: HostedJob): Promise<string> {
+    return this.requireAuthenticatedProviderHome(
+      {
+        userId: job.ownerClerkUserId,
+        email: null,
+        displayName: null,
+      },
+      "codex",
+    );
+  }
+
+  private async prepareJobForRecovery(
+    job: HostedJob,
+    recoveredAt: string,
+    input: {
+      readonly message: string;
+      readonly recoveryAction: HostedRecoveryAction;
+      readonly resultJson?: unknown;
+    },
+  ): Promise<HostedJob> {
+    const recoveredJob = await this.updateJobRecord(job.id, {
+      status: "queued",
+      startedAt: null,
+      finishedAt: null,
+      exitCode: null,
+      resultSummary: null,
+      resultJson: input.resultJson ?? null,
+      updatedAt: recoveredAt,
+    });
+    await this.appendJobEvent({
+      ownerClerkUserId: recoveredJob.ownerClerkUserId,
+      jobId: recoveredJob.id,
+      type: "info",
+      message: input.message,
+      payload: {
+        restartRecovered: true,
+        recoveredAfterRestart: true,
+        recoveryAction: input.recoveryAction,
+      },
+    });
+    return recoveredJob;
+  }
+
+  private async resetProjectRepoPath(repoPath: string): Promise<void> {
+    await fs.rm(repoPath, { recursive: true, force: true });
+    await fs.mkdir(repoPath, { recursive: true });
+  }
+
+  private async updateProjectRuntimeStatus(
+    projectId: HostedProject["id"],
+    status: HostedProject["status"],
+    updatedAt = nowIso(),
+  ): Promise<void> {
+    await this.options.runEffect(this.options.sql`
+      UPDATE hosted_projects
+      SET
+        status = ${status},
+        updated_at = ${updatedAt}
+      WHERE project_id = ${projectId}
+    `);
+  }
+
+  private rememberDeletedProjectOwner(
+    projectId: HostedProject["id"],
+    ownerClerkUserId: string,
+    ttlMs = 5 * 60 * 1000,
+  ): void {
+    this.deletedProjectOwners.set(projectId, {
+      ownerClerkUserId,
+      expiresAt: Date.now() + ttlMs,
+    });
+  }
+
+  private readRememberedDeletedProjectOwner(projectId: HostedProject["id"]): string | null {
+    const remembered = this.deletedProjectOwners.get(projectId);
+    if (!remembered) {
+      return null;
+    }
+    if (remembered.expiresAt <= Date.now()) {
+      this.deletedProjectOwners.delete(projectId);
+      return null;
+    }
+    return remembered.ownerClerkUserId;
+  }
+
+  private async dispatchOrchestrationCommand(
+    command: Parameters<OrchestrationEngineShape["dispatch"]>[0],
+  ) {
+    await this.options.runEffect(this.options.orchestrationEngine.dispatch(command));
+  }
+
+  private async startHostedAgentThreadTurn(input: {
+    readonly threadId: HostedAgentPromptJobInput["threadId"];
+    readonly turnId: TurnId;
+    readonly messageId: HostedAgentPromptJobInput["messageId"];
+    readonly prompt: HostedAgentPromptJobInput["prompt"];
+    readonly runtimeMode: HostedAgentPromptJobInput["runtimeMode"];
+    readonly createdAt: HostedAgentPromptJobInput["createdAt"];
+  }): Promise<void> {
+    await this.dispatchOrchestrationCommand({
+      type: "thread.message.user.append",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId: input.threadId,
+      message: {
+        messageId: input.messageId,
+        text: input.prompt,
+        attachments: [],
+      },
+      createdAt: input.createdAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.session.set",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId: input.threadId,
+      session: this.hostedAgentThreadSession({
+        threadId: input.threadId,
+        runtimeMode: input.runtimeMode,
+        status: "running",
+        activeTurnId: input.turnId,
+        lastError: null,
+        updatedAt: input.createdAt,
+      }),
+      createdAt: input.createdAt,
+    });
+  }
+
+  private async finalizeHostedAgentThreadTurnSuccess(input: {
+    readonly threadId: HostedJob["threadId"];
+    readonly jobId: HostedJob["id"];
+    readonly runtimeMode: RuntimeMode;
+    readonly assistantText: string;
+    readonly completedAt: string;
+  }): Promise<void> {
+    const turnId = hostedTurnIdForJob(input.jobId);
+    const assistantMessageId = hostedAssistantMessageIdForJob(input.jobId);
+    if (input.assistantText.length > 0) {
+      await this.dispatchOrchestrationCommand({
+        type: "thread.message.assistant.delta",
+        commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+        threadId: input.threadId!,
+        messageId: assistantMessageId,
+        delta: input.assistantText,
+        turnId,
+        createdAt: input.completedAt,
+      });
+    }
+    await this.dispatchOrchestrationCommand({
+      type: "thread.message.assistant.complete",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId: input.threadId!,
+      messageId: assistantMessageId,
+      turnId,
+      createdAt: input.completedAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.session.set",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId: input.threadId!,
+      session: this.hostedAgentThreadSession({
+        threadId: input.threadId!,
+        runtimeMode: input.runtimeMode,
+        status: "ready",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: input.completedAt,
+      }),
+      createdAt: input.completedAt,
+    });
+  }
+
+  private async finalizeHostedAgentThreadTurnFailure(input: {
+    readonly threadId: HostedJob["threadId"];
+    readonly jobId: HostedJob["id"];
+    readonly runtimeMode: RuntimeMode;
+    readonly summary: string;
+    readonly completedAt: string;
+  }): Promise<void> {
+    const threadId = input.threadId;
+    if (!threadId) {
+      return;
+    }
+    const turnId = hostedTurnIdForJob(input.jobId);
+    const assistantMessageId = hostedAssistantMessageIdForJob(input.jobId);
+    const assistantText = `Job failed: ${input.summary}`;
+    await this.dispatchOrchestrationCommand({
+      type: "thread.message.assistant.delta",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      messageId: assistantMessageId,
+      delta: assistantText,
+      turnId,
+      createdAt: input.completedAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.message.assistant.complete",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      messageId: assistantMessageId,
+      turnId,
+      createdAt: input.completedAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.activity.append",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      activity: {
+        id: EventId.makeUnsafe(crypto.randomUUID()),
+        tone: "error",
+        kind: "provider.turn.start.failed",
+        summary: input.summary,
+        payload: {
+          detail: input.summary,
+          source: "hosted-job",
+          jobId: input.jobId,
+        },
+        turnId,
+        createdAt: input.completedAt,
+      },
+      createdAt: input.completedAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.session.set",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      session: this.hostedAgentThreadSession({
+        threadId,
+        runtimeMode: input.runtimeMode,
+        status: "error",
+        activeTurnId: null,
+        lastError: summarizeText(input.summary, "Hosted agent job failed."),
+        updatedAt: input.completedAt,
+      }),
+      createdAt: input.completedAt,
+    });
+  }
+
+  private async finalizeHostedAgentThreadTurnCancelled(input: {
+    readonly threadId: HostedJob["threadId"];
+    readonly jobId: HostedJob["id"];
+    readonly runtimeMode: RuntimeMode;
+    readonly summary: string;
+    readonly completedAt: string;
+  }): Promise<void> {
+    const threadId = input.threadId;
+    if (!threadId) {
+      return;
+    }
+    const turnId = hostedTurnIdForJob(input.jobId);
+    const assistantMessageId = hostedAssistantMessageIdForJob(input.jobId);
+    await this.dispatchOrchestrationCommand({
+      type: "thread.message.assistant.delta",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      messageId: assistantMessageId,
+      delta: input.summary,
+      turnId,
+      createdAt: input.completedAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.message.assistant.complete",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      messageId: assistantMessageId,
+      turnId,
+      createdAt: input.completedAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.activity.append",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      activity: {
+        id: EventId.makeUnsafe(crypto.randomUUID()),
+        tone: "info",
+        kind: "hosted.job.cancelled",
+        summary: input.summary,
+        payload: {
+          detail: input.summary,
+          source: "hosted-job",
+          jobId: input.jobId,
+        },
+        turnId,
+        createdAt: input.completedAt,
+      },
+      createdAt: input.completedAt,
+    });
+    await this.dispatchOrchestrationCommand({
+      type: "thread.session.set",
+      commandId: CommandId.makeUnsafe(crypto.randomUUID()),
+      threadId,
+      session: this.hostedAgentThreadSession({
+        threadId,
+        runtimeMode: input.runtimeMode,
+        status: "ready",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: input.completedAt,
+      }),
+      createdAt: input.completedAt,
+    });
+  }
+
+  private hostedAgentThreadSession(input: {
+    readonly threadId: HostedAgentPromptJobInput["threadId"];
+    readonly runtimeMode: RuntimeMode;
+    readonly status: OrchestrationSession["status"];
+    readonly activeTurnId: TurnId | null;
+    readonly lastError: string | null;
+    readonly updatedAt: string;
+  }): OrchestrationSession {
+    return {
+      threadId: input.threadId,
+      status: input.status,
+      providerName: "codex",
+      runtimeMode: input.runtimeMode,
+      activeTurnId: input.activeTurnId,
+      lastError: input.lastError,
+      updatedAt: input.updatedAt,
+    };
+  }
+
+  private isCancellationRequested(jobId: HostedJob["id"]): boolean {
+    return this.jobExecutionControls.get(jobId)?.cancelRequestedAt !== null;
+  }
+
+  private async finalizeCancelledJob(jobId: HostedJob["id"]): Promise<HostedJob> {
+    const job = await this.getJobRecord(jobId);
+    if (!job) {
+      throw new Error(`Unknown hosted job: ${jobId}`);
+    }
+    if (job.status === "cancelled") {
+      return job;
+    }
+
+    const control = this.jobExecutionControls.get(jobId);
+    const cancelledAt = control?.cancelRequestedAt ?? nowIso();
+    const summary = control?.cancelSummary ?? this.jobCancellationSummary(job);
+    if (job.kind === "clone_repo") {
+      const project = await this.getProjectRecord(job.projectId);
+      if (project) {
+        await this.resetProjectRepoPath(project.repoPath).catch(() => undefined);
+        await this.options.runEffect(this.options.sql`
+          UPDATE hosted_projects
+          SET
+            status = 'error',
+            current_branch = ${null},
+            updated_at = ${cancelledAt}
+          WHERE project_id = ${project.id}
+            AND owner_clerk_user_id = ${project.ownerClerkUserId}
+        `);
+      }
+    }
+
+    const cancelledJob = await this.updateJobRecord(jobId, {
+      status: "cancelled",
+      finishedAt: cancelledAt,
+      updatedAt: cancelledAt,
+      resultSummary: summary,
+    });
+    await this.appendJobEvent({
+      ownerClerkUserId: cancelledJob.ownerClerkUserId,
+      jobId: cancelledJob.id,
+      type: "info",
+      message: summary,
+      payload: {
+        cancelledBy: "user",
+      },
+    });
+    if (cancelledJob.kind === "agent_prompt" && cancelledJob.threadId) {
+      await this.finalizeHostedAgentThreadTurnCancelled({
+        threadId: cancelledJob.threadId,
+        jobId: cancelledJob.id,
+        runtimeMode: this.readRuntimeModeFromUnknown(cancelledJob.inputJson),
+        summary,
+        completedAt: cancelledAt,
+      });
+    }
+    return cancelledJob;
+  }
+
+  private async stopIfCancelled(jobId: HostedJob["id"]): Promise<boolean> {
+    if (!this.isCancellationRequested(jobId)) {
+      const job = await this.getJobRecord(jobId);
+      return job?.status === "cancelled";
+    }
+    await this.finalizeCancelledJob(jobId);
+    return true;
   }
 
   private async runCommandJob(
@@ -1269,10 +2067,16 @@ export class HostedRuntime {
     jobId: HostedJob["id"],
     command: string,
   ): Promise<void> {
+    if (await this.stopIfCancelled(jobId)) {
+      return;
+    }
     await this.updateJobRecord(jobId, {
       status: "starting",
       startedAt: nowIso(),
     });
+    if (await this.stopIfCancelled(jobId)) {
+      return;
+    }
     await this.appendJobEvent({
       ownerClerkUserId: project.ownerClerkUserId,
       jobId,
@@ -1293,6 +2097,9 @@ export class HostedRuntime {
             stdio: ["pipe", "pipe", "pipe"],
           }),
         onSpawn: async () => {
+          if (await this.stopIfCancelled(jobId)) {
+            return;
+          }
           await this.updateJobRecord(jobId, {
             status: "running",
           });
@@ -1305,6 +2112,9 @@ export class HostedRuntime {
         },
       });
       await this.refreshProjectGitState(project);
+      if (await this.stopIfCancelled(jobId)) {
+        return;
+      }
       if (result.exitCode === 0) {
         const summary = summarizeText(
           result.stdoutPreview || result.stderrPreview,
@@ -1354,6 +2164,9 @@ export class HostedRuntime {
         message: failureSummary,
       });
     } catch (error) {
+      if (await this.stopIfCancelled(jobId)) {
+        return;
+      }
       const failureSummary = summarizeText(
         error instanceof Error ? error.message : String(error),
         "Command job failed.",
@@ -1375,38 +2188,80 @@ export class HostedRuntime {
   private async runAgentPromptJob(
     project: HostedProject,
     jobId: HostedJob["id"],
-    input: HostedAgentPromptJobInput,
+    input: AgentPromptJobExecutionInput,
     providerHome: string,
+    threadId: HostedJob["threadId"],
+    recoveryContext?: HostedAgentRecoveryContext,
   ): Promise<void> {
     const outputPath = nodePath.join(project.storageRoot, "jobs", `${jobId}-assistant.txt`);
     await fs.mkdir(nodePath.dirname(outputPath), { recursive: true });
+    const promptText = recoveryContext
+      ? this.buildHostedAgentResumePrompt(input.prompt)
+      : input.prompt;
+    const args = this.buildHostedAgentExecArgs({
+      input,
+      outputPath,
+      sessionId: recoveryContext?.sessionId ?? null,
+    });
+    let codexSessionId: string | null = null;
 
+    const persistCodexSessionId = async (nextSessionId: string | null) => {
+      if (!nextSessionId || codexSessionId === nextSessionId) {
+        return;
+      }
+      codexSessionId = nextSessionId;
+      const current = await this.getJobRecord(jobId);
+      if (!current) {
+        return;
+      }
+      const existingResultJson = asRecord(current.resultJson) ?? {};
+      await this.updateJobRecord(jobId, {
+        resultJson: {
+          ...existingResultJson,
+          codexSessionId: nextSessionId,
+          model: input.model ?? null,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode,
+          ...(recoveryContext
+            ? {
+                recovery: {
+                  sessionId: recoveryContext.sessionId,
+                  recoveredAt: recoveryContext.recoveredAt,
+                  strategy: "resume-session",
+                },
+              }
+            : {}),
+        },
+      });
+    };
+
+    if (await this.stopIfCancelled(jobId)) {
+      return;
+    }
+    if (recoveryContext?.sessionId) {
+      await persistCodexSessionId(recoveryContext.sessionId);
+    }
     await this.updateJobRecord(jobId, {
       status: "starting",
       startedAt: nowIso(),
     });
+    if (await this.stopIfCancelled(jobId)) {
+      return;
+    }
     await this.appendJobEvent({
       ownerClerkUserId: project.ownerClerkUserId,
       jobId,
       type: "status",
-      message: "Starting Codex agent job.",
+      message: recoveryContext
+        ? "Resuming Codex agent job from the persisted session."
+        : "Starting Codex agent job.",
     });
-
-    const args = [
-      "exec",
-      "--ephemeral",
-      "--output-last-message",
-      outputPath,
-      ...(input.model ? ["--model", input.model] : []),
-      ...mapHostedRuntimeModeToExecArgs(input.runtimeMode),
-      "-",
-    ];
 
     try {
       const result = await this.runStreamingJobProcess({
         jobId,
         ownerClerkUserId: project.ownerClerkUserId,
-        stdinText: input.prompt,
+        stdinText: promptText,
         start: () =>
           spawn("codex", args, {
             cwd: project.repoPath,
@@ -1418,6 +2273,9 @@ export class HostedRuntime {
             stdio: ["pipe", "pipe", "pipe"],
           }),
         onSpawn: async () => {
+          if (await this.stopIfCancelled(jobId)) {
+            return;
+          }
           await this.updateJobRecord(jobId, {
             status: "running",
           });
@@ -1428,30 +2286,44 @@ export class HostedRuntime {
             message: "Codex agent job is running.",
           });
         },
+        onStdoutLine: async (line) => {
+          const nextSessionId = readCodexExecThreadIdFromJsonLine(line);
+          if (!nextSessionId) {
+            return;
+          }
+          await persistCodexSessionId(nextSessionId);
+        },
       });
 
       const lastMessage = await fs.readFile(outputPath, "utf8").catch(() => "");
       await this.refreshProjectGitState(project);
+      if (!codexSessionId) {
+        const persistedJob = await this.getJobRecord(jobId);
+        if (persistedJob) {
+          codexSessionId = await this.readHostedAgentSessionId(persistedJob);
+        }
+      }
+      if (await this.stopIfCancelled(jobId)) {
+        return;
+      }
       if (result.exitCode === 0) {
         const summary = summarizeText(
           lastMessage || result.stdoutPreview || result.stderrPreview,
           "Codex agent job completed.",
         );
+        const completedAt = nowIso();
         await this.updateJobRecord(jobId, {
           status: "completed",
-          finishedAt: nowIso(),
+          finishedAt: completedAt,
           exitCode: 0,
           resultSummary: summary,
-          resultJson: {
+          resultJson: this.createHostedAgentResultJson({
+            input,
             lastMessage,
-            stdoutPreview: result.stdoutPreview,
-            stderrPreview: result.stderrPreview,
-            stdoutTruncated: result.stdoutTruncated,
-            stderrTruncated: result.stderrTruncated,
-            model: input.model ?? null,
-            runtimeMode: input.runtimeMode,
-            interactionMode: input.interactionMode,
-          },
+            result,
+            sessionId: codexSessionId,
+            recoveryContext,
+          }),
         });
         await this.appendJobEvent({
           ownerClerkUserId: project.ownerClerkUserId,
@@ -1462,6 +2334,25 @@ export class HostedRuntime {
             lastMessage,
           },
         });
+        try {
+          await this.finalizeHostedAgentThreadTurnSuccess({
+            threadId,
+            jobId,
+            runtimeMode: input.runtimeMode,
+            assistantText: lastMessage,
+            completedAt,
+          });
+        } catch (error) {
+          await this.appendJobEvent({
+            ownerClerkUserId: project.ownerClerkUserId,
+            jobId,
+            type: "error",
+            message: summarizeText(
+              error instanceof Error ? error.message : String(error),
+              "Hosted job completed but chat transcript sync failed.",
+            ),
+          });
+        }
         return;
       }
 
@@ -1469,21 +2360,19 @@ export class HostedRuntime {
         result.stderrPreview || result.stdoutPreview || lastMessage,
         "Codex agent job failed.",
       );
+      const completedAt = nowIso();
       await this.updateJobRecord(jobId, {
         status: "failed",
-        finishedAt: nowIso(),
+        finishedAt: completedAt,
         exitCode: result.exitCode,
         resultSummary: failureSummary,
-        resultJson: {
+        resultJson: this.createHostedAgentResultJson({
+          input,
           lastMessage,
-          stdoutPreview: result.stdoutPreview,
-          stderrPreview: result.stderrPreview,
-          stdoutTruncated: result.stdoutTruncated,
-          stderrTruncated: result.stderrTruncated,
-          model: input.model ?? null,
-          runtimeMode: input.runtimeMode,
-          interactionMode: input.interactionMode,
-        },
+          result,
+          sessionId: codexSessionId,
+          recoveryContext,
+        }),
       });
       await this.appendJobEvent({
         ownerClerkUserId: project.ownerClerkUserId,
@@ -1491,15 +2380,51 @@ export class HostedRuntime {
         type: "error",
         message: failureSummary,
       });
+      try {
+        await this.finalizeHostedAgentThreadTurnFailure({
+          threadId,
+          jobId,
+          runtimeMode: input.runtimeMode,
+          summary: failureSummary,
+          completedAt,
+        });
+      } catch (error) {
+        await this.appendJobEvent({
+          ownerClerkUserId: project.ownerClerkUserId,
+          jobId,
+          type: "error",
+          message: summarizeText(
+            error instanceof Error ? error.message : String(error),
+            "Hosted job failed and transcript sync also failed.",
+          ),
+        });
+      }
     } catch (error) {
+      if (await this.stopIfCancelled(jobId)) {
+        return;
+      }
       const failureSummary = summarizeText(
         error instanceof Error ? error.message : String(error),
         "Codex agent job failed.",
       );
+      const completedAt = nowIso();
       await this.updateJobRecord(jobId, {
         status: "failed",
-        finishedAt: nowIso(),
+        finishedAt: completedAt,
         resultSummary: failureSummary,
+        resultJson: this.createHostedAgentResultJson({
+          input,
+          lastMessage: "",
+          result: {
+            exitCode: 1,
+            stdoutPreview: "",
+            stderrPreview: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          },
+          sessionId: codexSessionId,
+          recoveryContext,
+        }),
       });
       await this.appendJobEvent({
         ownerClerkUserId: project.ownerClerkUserId,
@@ -1507,7 +2432,82 @@ export class HostedRuntime {
         type: "error",
         message: failureSummary,
       });
+      try {
+        await this.finalizeHostedAgentThreadTurnFailure({
+          threadId,
+          jobId,
+          runtimeMode: input.runtimeMode,
+          summary: failureSummary,
+          completedAt,
+        });
+      } catch (nestedError) {
+        await this.appendJobEvent({
+          ownerClerkUserId: project.ownerClerkUserId,
+          jobId,
+          type: "error",
+          message: summarizeText(
+            nestedError instanceof Error ? nestedError.message : String(nestedError),
+            "Hosted job failed and transcript sync also failed.",
+          ),
+        });
+      }
     }
+  }
+
+  private buildHostedAgentExecArgs(input: {
+    readonly input: AgentPromptJobExecutionInput;
+    readonly outputPath: string;
+    readonly sessionId: string | null;
+  }): string[] {
+    const baseArgs = [
+      "--json",
+      "--output-last-message",
+      input.outputPath,
+      ...(input.input.model ? ["--model", input.input.model] : []),
+      ...mapHostedRuntimeModeToExecArgs(input.input.runtimeMode),
+    ];
+    if (input.sessionId) {
+      return ["exec", "resume", ...baseArgs, input.sessionId, "-"];
+    }
+    return ["exec", ...baseArgs, "-"];
+  }
+
+  private buildHostedAgentResumePrompt(originalPrompt: string): string {
+    return [
+      "The previous Codex turn was interrupted by a server restart.",
+      `Original request: ${summarizeText(originalPrompt, "Continue the previous task.")}`,
+      "Continue from the existing session state.",
+      "Do not restart from scratch or repeat work that is already complete unless it is required to finish accurately.",
+    ].join("\n");
+  }
+
+  private createHostedAgentResultJson(input: {
+    readonly input: AgentPromptJobExecutionInput;
+    readonly lastMessage: string;
+    readonly result: StreamingProcessResult;
+    readonly sessionId: string | null;
+    readonly recoveryContext: HostedAgentRecoveryContext | undefined;
+  }): Record<string, unknown> {
+    return {
+      lastMessage: input.lastMessage,
+      stdoutPreview: input.result.stdoutPreview,
+      stderrPreview: input.result.stderrPreview,
+      stdoutTruncated: input.result.stdoutTruncated,
+      stderrTruncated: input.result.stderrTruncated,
+      model: input.input.model ?? null,
+      runtimeMode: input.input.runtimeMode,
+      interactionMode: input.input.interactionMode,
+      codexSessionId: input.sessionId,
+      ...(input.recoveryContext
+        ? {
+            recovery: {
+              sessionId: input.recoveryContext.sessionId,
+              recoveredAt: input.recoveryContext.recoveredAt,
+              strategy: "resume-session",
+            },
+          }
+        : {}),
+    };
   }
 
   private async runStreamingJobProcess(input: {
@@ -1516,21 +2516,58 @@ export class HostedRuntime {
     readonly start: () => StreamingChildProcess;
     readonly stdinText: string | undefined;
     readonly onSpawn?: () => Promise<void>;
+    readonly onStdoutLine?: (line: string) => Promise<void>;
+    readonly onStderrLine?: (line: string) => Promise<void>;
   }): Promise<StreamingProcessResult> {
     let stdoutPreview = "";
     let stderrPreview = "";
     let stdoutTruncated = false;
     let stderrTruncated = false;
     const pendingWrites: Array<Promise<void>> = [];
+    let stdoutLineBuffer = "";
+    let stderrLineBuffer = "";
+
+    const enqueueLineCallbacks = (
+      buffer: string,
+      onLine: ((line: string) => Promise<void>) | undefined,
+    ): string => {
+      if (!onLine) {
+        return "";
+      }
+      let nextBuffer = buffer;
+      let newlineIndex = nextBuffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = nextBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+        nextBuffer = nextBuffer.slice(newlineIndex + 1);
+        pendingWrites.push(onLine(line).then(() => undefined));
+        newlineIndex = nextBuffer.indexOf("\n");
+      }
+      return nextBuffer;
+    };
 
     const child = input.start();
+    const control = this.jobExecutionControls.get(input.jobId);
+    if (control) {
+      control.child = child;
+      if (control.cancelRequestedAt !== null) {
+        killChild(child);
+      }
+    }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+
+    const clearActiveChild = () => {
+      const activeControl = this.jobExecutionControls.get(input.jobId);
+      if (activeControl?.child === child) {
+        activeControl.child = null;
+      }
+    };
 
     child.stdout.on("data", (chunk: string) => {
       const appended = appendPreview(stdoutPreview, chunk);
       stdoutPreview = appended.next;
       stdoutTruncated ||= appended.truncated;
+      stdoutLineBuffer = enqueueLineCallbacks(`${stdoutLineBuffer}${chunk}`, input.onStdoutLine);
       pendingWrites.push(
         this.appendJobEvent({
           ownerClerkUserId: input.ownerClerkUserId,
@@ -1545,6 +2582,7 @@ export class HostedRuntime {
       const appended = appendPreview(stderrPreview, chunk);
       stderrPreview = appended.next;
       stderrTruncated ||= appended.truncated;
+      stderrLineBuffer = enqueueLineCallbacks(`${stderrLineBuffer}${chunk}`, input.onStderrLine);
       pendingWrites.push(
         this.appendJobEvent({
           ownerClerkUserId: input.ownerClerkUserId,
@@ -1558,9 +2596,18 @@ export class HostedRuntime {
     await input.onSpawn?.();
 
     const exitCode = await new Promise<number>((resolve, reject) => {
-      child.once("error", reject);
-      child.stdin.once("error", reject);
+      child.once("error", (error) => {
+        clearActiveChild();
+        reject(error);
+      });
+      child.stdin.once("error", (error) => {
+        if (this.isCancellationRequested(input.jobId)) {
+          return;
+        }
+        reject(error);
+      });
       child.once("close", (code: number | null) => {
+        clearActiveChild();
         resolve(code ?? 1);
       });
 
@@ -1570,6 +2617,17 @@ export class HostedRuntime {
       }
       child.stdin.end();
     });
+
+    if (input.onStdoutLine && stdoutLineBuffer.length > 0) {
+      pendingWrites.push(
+        input.onStdoutLine(stdoutLineBuffer.replace(/\r$/, "")).then(() => undefined),
+      );
+    }
+    if (input.onStderrLine && stderrLineBuffer.length > 0) {
+      pendingWrites.push(
+        input.onStderrLine(stderrLineBuffer.replace(/\r$/, "")).then(() => undefined),
+      );
+    }
 
     const settledWrites = await Promise.allSettled(pendingWrites);
     const rejectedWrite = settledWrites.find(
@@ -1688,6 +2746,40 @@ export class HostedRuntime {
 
     const row = rows[0];
     return row ? toHostedJobRow(row) : null;
+  }
+
+  private async listActiveProjectJobs(
+    projectId: HostedProject["id"],
+    ownerClerkUserId: string,
+  ): Promise<HostedJob[]> {
+    const rows = (await this.options.runEffect(this.options.sql`
+      SELECT
+        job_id AS "id",
+        project_id AS "projectId",
+        owner_clerk_user_id AS "ownerClerkUserId",
+        kind,
+        provider,
+        status,
+        title,
+        command,
+        cwd,
+        thread_id AS "threadId",
+        input_json AS "inputJson",
+        result_json AS "resultJson",
+        result_summary AS "resultSummary",
+        exit_code AS "exitCode",
+        started_at AS "startedAt",
+        finished_at AS "finishedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM jobs
+      WHERE project_id = ${projectId}
+        AND owner_clerk_user_id = ${ownerClerkUserId}
+        AND status IN ('queued', 'starting', 'running')
+      ORDER BY created_at ASC
+    `)) as Array<Record<string, unknown>>;
+
+    return rows.map(toHostedJobRow);
   }
 
   private providerHomePath(ownerClerkUserId: string, provider: ProviderKind): string {
@@ -2480,6 +3572,9 @@ export class HostedRuntime {
     if (!existing) {
       throw new Error(`Unknown hosted job: ${jobId}`);
     }
+    if (existing.status === "cancelled" && patch.status !== "cancelled") {
+      return existing;
+    }
 
     const next: HostedJob = {
       ...existing,
@@ -2578,15 +3673,21 @@ export class HostedRuntime {
     gitRemoteUrl: string,
     defaultBranch: string | null,
   ): Promise<void> {
+    if (await this.stopIfCancelled(jobId)) {
+      return;
+    }
     await this.updateJobRecord(jobId, {
-      status: "running",
+      status: "starting",
       startedAt: nowIso(),
     });
+    if (await this.stopIfCancelled(jobId)) {
+      return;
+    }
     await this.appendJobEvent({
       ownerClerkUserId: project.ownerClerkUserId,
       jobId,
-      type: "info",
-      message: `Cloning ${gitRemoteUrl}`,
+      type: "status",
+      message: `Preparing clone: ${gitRemoteUrl}`,
     });
 
     const cloneArgs = defaultBranch
@@ -2601,74 +3702,140 @@ export class HostedRuntime {
         ]
       : ["clone", "--", gitRemoteUrl, project.repoPath];
 
-    const result = await this.runProcess("git", cloneArgs, project.storageRoot);
-    const updatedAt = nowIso();
+    try {
+      const result = await this.runStreamingJobProcess({
+        jobId,
+        ownerClerkUserId: project.ownerClerkUserId,
+        stdinText: undefined,
+        start: () =>
+          spawn("git", cloneArgs, {
+            cwd: project.storageRoot,
+            env: process.env,
+            shell: process.platform === "win32",
+            stdio: ["pipe", "pipe", "pipe"],
+          }),
+        onSpawn: async () => {
+          if (await this.stopIfCancelled(jobId)) {
+            return;
+          }
+          await this.updateJobRecord(jobId, {
+            status: "running",
+          });
+          await this.appendJobEvent({
+            ownerClerkUserId: project.ownerClerkUserId,
+            jobId,
+            type: "status",
+            message: "Repository clone is running.",
+          });
+        },
+      });
+      if (await this.stopIfCancelled(jobId)) {
+        return;
+      }
 
-    if (result.exitCode === 0) {
-      const currentBranch = await this.readCurrentBranch(project.repoPath);
+      const updatedAt = nowIso();
+      if (result.exitCode === 0) {
+        const currentBranch = await this.readCurrentBranch(project.repoPath);
+        await this.options.runEffect(this.options.sql`
+          UPDATE hosted_projects
+          SET
+            status = 'ready',
+            default_branch = ${defaultBranch ?? currentBranch},
+            current_branch = ${currentBranch},
+            updated_at = ${updatedAt}
+          WHERE project_id = ${project.id}
+            AND owner_clerk_user_id = ${project.ownerClerkUserId}
+        `);
+        await this.updateJobRecord(jobId, {
+          status: "completed",
+          finishedAt: updatedAt,
+          exitCode: 0,
+          resultSummary: `Repository cloned into ${project.repoPath}`,
+          resultJson: {
+            stdoutPreview: result.stdoutPreview,
+            stderrPreview: result.stderrPreview,
+            stdoutTruncated: result.stdoutTruncated,
+            stderrTruncated: result.stderrTruncated,
+            branch: currentBranch,
+          },
+        });
+        await this.appendJobEvent({
+          ownerClerkUserId: project.ownerClerkUserId,
+          jobId,
+          type: "result",
+          message: `Clone completed on branch ${currentBranch ?? "(detached)"}`,
+          payload: {
+            stdoutPreview: result.stdoutPreview,
+            stderrPreview: result.stderrPreview,
+            stdoutTruncated: result.stdoutTruncated,
+            stderrTruncated: result.stderrTruncated,
+          },
+        });
+        return;
+      }
+
       await this.options.runEffect(this.options.sql`
         UPDATE hosted_projects
         SET
-          status = 'ready',
-          default_branch = ${defaultBranch ?? currentBranch},
-          current_branch = ${currentBranch},
+          status = 'error',
           updated_at = ${updatedAt}
         WHERE project_id = ${project.id}
           AND owner_clerk_user_id = ${project.ownerClerkUserId}
       `);
       await this.updateJobRecord(jobId, {
-        status: "completed",
+        status: "failed",
         finishedAt: updatedAt,
-        exitCode: 0,
-        resultSummary: `Repository cloned into ${project.repoPath}`,
+        exitCode: result.exitCode,
+        resultSummary: "Repository clone failed",
         resultJson: {
-          stdout: result.stdout,
-          stderr: result.stderr,
-          branch: currentBranch,
+          stdoutPreview: result.stdoutPreview,
+          stderrPreview: result.stderrPreview,
+          stdoutTruncated: result.stdoutTruncated,
+          stderrTruncated: result.stderrTruncated,
         },
       });
       await this.appendJobEvent({
         ownerClerkUserId: project.ownerClerkUserId,
         jobId,
-        type: "result",
-        message: `Clone completed on branch ${currentBranch ?? "(detached)"}`,
+        type: "error",
+        message: result.stderrPreview.trim() || "git clone failed",
         payload: {
-          stdout: result.stdout,
-          stderr: result.stderr,
+          exitCode: result.exitCode,
+          stdoutPreview: result.stdoutPreview,
+          stderrPreview: result.stderrPreview,
+          stdoutTruncated: result.stdoutTruncated,
+          stderrTruncated: result.stderrTruncated,
         },
       });
-      return;
+    } catch (error) {
+      if (await this.stopIfCancelled(jobId)) {
+        return;
+      }
+      const updatedAt = nowIso();
+      await this.options.runEffect(this.options.sql`
+        UPDATE hosted_projects
+        SET
+          status = 'error',
+          updated_at = ${updatedAt}
+        WHERE project_id = ${project.id}
+          AND owner_clerk_user_id = ${project.ownerClerkUserId}
+      `);
+      const failureSummary = summarizeText(
+        error instanceof Error ? error.message : String(error),
+        "Repository clone failed",
+      );
+      await this.updateJobRecord(jobId, {
+        status: "failed",
+        finishedAt: updatedAt,
+        resultSummary: failureSummary,
+      });
+      await this.appendJobEvent({
+        ownerClerkUserId: project.ownerClerkUserId,
+        jobId,
+        type: "error",
+        message: failureSummary,
+      });
     }
-
-    await this.options.runEffect(this.options.sql`
-      UPDATE hosted_projects
-      SET
-        status = 'error',
-        updated_at = ${updatedAt}
-      WHERE project_id = ${project.id}
-        AND owner_clerk_user_id = ${project.ownerClerkUserId}
-    `);
-    await this.updateJobRecord(jobId, {
-      status: "failed",
-      finishedAt: updatedAt,
-      exitCode: result.exitCode,
-      resultSummary: "Repository clone failed",
-      resultJson: {
-        stdout: result.stdout,
-        stderr: result.stderr,
-      },
-    });
-    await this.appendJobEvent({
-      ownerClerkUserId: project.ownerClerkUserId,
-      jobId,
-      type: "error",
-      message: result.stderr.trim() || "git clone failed",
-      payload: {
-        exitCode: result.exitCode,
-        stdout: result.stdout,
-        stderr: result.stderr,
-      },
-    });
   }
 
   private async readCurrentBranch(repoPath: string): Promise<string | null> {

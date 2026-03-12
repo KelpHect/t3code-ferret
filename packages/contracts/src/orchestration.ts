@@ -483,6 +483,18 @@ const ThreadSessionSetCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadMessageUserAppendCommand = Schema.Struct({
+  type: Schema.Literal("thread.message.user.append"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  message: Schema.Struct({
+    messageId: MessageId,
+    text: Schema.String,
+    attachments: Schema.Array(ChatAttachment),
+  }),
+  createdAt: IsoDateTime,
+});
+
 const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   type: Schema.Literal("thread.message.assistant.delta"),
   commandId: CommandId,
@@ -542,6 +554,7 @@ const ThreadRevertCompleteCommand = Schema.Struct({
 
 const InternalOrchestrationCommand = Schema.Union([
   ThreadSessionSetCommand,
+  ThreadMessageUserAppendCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
   ThreadProposedPlanUpsertCommand,

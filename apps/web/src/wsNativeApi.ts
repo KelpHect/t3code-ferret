@@ -117,6 +117,7 @@ export function createWsNativeApi(): NativeApi {
       create: (input) => transport.request(WS_METHODS.projectsCreate, input),
       get: (input) => transport.request(WS_METHODS.projectsGet, input),
       archive: (input) => transport.request(WS_METHODS.projectsArchive, input),
+      delete: (input) => transport.request(WS_METHODS.projectsDelete, input),
       listFiles: (input) => transport.request(WS_METHODS.projectsFilesList, input),
       readFile: (input) => transport.request(WS_METHODS.projectsFilesRead, input),
       searchEntries: (input) => transport.request(WS_METHODS.projectsSearchEntries, input),
@@ -180,8 +181,13 @@ export function createWsNativeApi(): NativeApi {
       list: (input) => transport.request(WS_METHODS.jobsList, input),
       get: (input) => transport.request(WS_METHODS.jobsGet, input),
       events: (input) => transport.request(WS_METHODS.jobsEvents, input),
+      cancel: (input) => transport.request(WS_METHODS.jobsCancel, input),
       runCommand: (input) => transport.request(WS_METHODS.jobsRunCommand, input),
       agentPrompt: (input) => transport.request(WS_METHODS.jobsAgentPrompt, input),
+      onEvent: (callback) =>
+        transport.subscribe(WS_CHANNELS.jobEvent, (message) => callback(message.data)),
+      onUpdated: (callback) =>
+        transport.subscribe(WS_CHANNELS.jobUpdated, (message) => callback(message.data)),
     },
     providers: {
       list: () => transport.request(WS_METHODS.providersList),

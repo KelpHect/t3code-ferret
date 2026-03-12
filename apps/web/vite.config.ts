@@ -50,5 +50,88 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: buildSourcemap,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const normalizedId = id.replaceAll("\\", "/");
+          if (!normalizedId.includes("/node_modules/")) {
+            return undefined;
+          }
+          if (normalizedId.includes("/node_modules/@pierre/diffs/react/")) {
+            return "vendor-diffs-react";
+          }
+          if (normalizedId.includes("/node_modules/@pierre/diffs/worker/")) {
+            return "vendor-diffs-worker";
+          }
+          if (normalizedId.includes("/node_modules/@shikijs/langs/")) {
+            return "vendor-shiki-langs";
+          }
+          if (normalizedId.includes("/node_modules/@shikijs/themes/")) {
+            return "vendor-shiki-themes";
+          }
+          if (
+            normalizedId.includes("/node_modules/@shikijs/engine-") ||
+            normalizedId.includes("/node_modules/@shikijs/vscode-textmate/")
+          ) {
+            return "vendor-shiki-engine";
+          }
+          if (
+            normalizedId.includes("/node_modules/shiki/") ||
+            normalizedId.includes("/node_modules/@shikijs/")
+          ) {
+            return "vendor-shiki-core";
+          }
+          if (normalizedId.includes("/node_modules/@pierre/diffs/")) {
+            return "vendor-diffs-core";
+          }
+          if (normalizedId.includes("/node_modules/@xterm/")) {
+            return "vendor-terminal";
+          }
+          if (
+            normalizedId.includes("/node_modules/lexical/") ||
+            normalizedId.includes("/node_modules/@lexical/")
+          ) {
+            return "vendor-lexical";
+          }
+          if (
+            normalizedId.includes("/node_modules/react-markdown/") ||
+            normalizedId.includes("/node_modules/remark-gfm/") ||
+            normalizedId.includes("/node_modules/remark-") ||
+            normalizedId.includes("/node_modules/rehype-") ||
+            normalizedId.includes("/node_modules/unified/") ||
+            normalizedId.includes("/node_modules/mdast-") ||
+            normalizedId.includes("/node_modules/micromark/")
+          ) {
+            return "vendor-markdown";
+          }
+          if (normalizedId.includes("/node_modules/@clerk/")) {
+            return "vendor-clerk";
+          }
+          if (
+            normalizedId.includes("/node_modules/@radix-ui/") ||
+            normalizedId.includes("/node_modules/@floating-ui/")
+          ) {
+            return "vendor-ui";
+          }
+          if (normalizedId.includes("/node_modules/effect/")) {
+            return "vendor-effect";
+          }
+          if (normalizedId.includes("/node_modules/lucide-react/")) {
+            return "vendor-icons";
+          }
+          if (normalizedId.includes("/node_modules/@tanstack/")) {
+            return "vendor-tanstack";
+          }
+          if (
+            normalizedId.includes("/node_modules/react/") ||
+            normalizedId.includes("/node_modules/react-dom/") ||
+            normalizedId.includes("/node_modules/scheduler/")
+          ) {
+            return "vendor-react";
+          }
+          return "vendor-misc";
+        },
+      },
+    },
   },
 });

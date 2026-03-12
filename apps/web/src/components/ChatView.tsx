@@ -31,6 +31,8 @@ import {
 } from "@t3tools/shared/model";
 import {
   memo,
+  Suspense,
+  lazy,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -126,8 +128,6 @@ import {
   shortcutLabelForCommand,
 } from "../keybindings";
 import ChatMarkdown from "./ChatMarkdown";
-import PlanSidebar from "./PlanSidebar";
-import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "./ui/alert";
 import {
   BotIcon,
@@ -177,7 +177,7 @@ import {
   Zed,
 } from "./Icons";
 import { cn, isMacPlatform, isWindowsPlatform, randomUUID } from "~/lib/utils";
-import { getRuntimePublicConfig } from "../runtimeConfig";
+import { getRuntimePublicConfig, useRuntimePublicConfig } from "../runtimeConfig";
 import { Badge } from "./ui/badge";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { Command, CommandItem, CommandList } from "./ui/command";
@@ -219,6 +219,10 @@ import { clamp } from "effect/Number";
 import { ComposerPromptEditor, type ComposerPromptEditorHandle } from "./ComposerPromptEditor";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { estimateTimelineMessageHeight } from "./timelineHeight";
+
+const HostedJobsPanel = lazy(() => import("./HostedJobsPanel"));
+const PlanSidebar = lazy(() => import("./PlanSidebar"));
+const ThreadTerminalDrawer = lazy(() => import("./ThreadTerminalDrawer"));
 
 function formatMessageMeta(createdAt: string, duration: string | null): string {
   if (!duration) return formatTimestamp(createdAt);
@@ -765,6 +769,8 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const activeLatestTurn = activeThread?.latestTurn ?? null;
   const latestTurnSettled = isLatestTurnSettled(activeLatestTurn, activeThread?.session ?? null);
   const activeProject = projects.find((p) => p.id === activeThread?.projectId);
+  const runtimePublicConfig = useRuntimePublicConfig();
+  const isSelfHosted = runtimePublicConfig.deploymentMode === "self-hosted";
 
   const openPullRequestDialog = useCallback(
     (reference?: string) => {
@@ -2551,6 +2557,38 @@ export default function ChatView({ threadId }: ChatViewProps) {
     [activeThread, isConnecting, isRevertingCheckpoint, isSendBusy, phase, setThreadError],
   );
 
+  const startHostedAgentPromptTurn = useCallback(
+    async ({
+      threadId,
+      messageId,
+      text,
+      createdAt,
+      interactionMode: nextInteractionMode,
+    }: {
+      threadId: ThreadId;
+      messageId: MessageId;
+      text: string;
+      createdAt: string;
+      interactionMode: ProviderInteractionMode;
+    }) => {
+      const api = readNativeApi();
+      if (!api || !activeProject) {
+        throw new Error("No active project is available.");
+      }
+      return api.jobs.agentPrompt({
+        projectId: activeProject.id,
+        threadId,
+        messageId,
+        prompt: text,
+        ...(selectedModel ? { model: selectedModel } : {}),
+        runtimeMode,
+        interactionMode: nextInteractionMode,
+        createdAt,
+      });
+    },
+    [activeProject, runtimeMode, selectedModel],
+  );
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     const api = readNativeApi();
@@ -2590,6 +2628,13 @@ export default function ChatView({ threadId }: ChatViewProps) {
     if (!trimmed && composerImages.length === 0) return;
     if (!activeProject) return;
     const threadIdForSend = activeThread.id;
+    if (isSelfHosted && composerImages.length > 0) {
+      setStoreThreadError(
+        threadIdForSend,
+        "Image attachments are not yet supported in self-hosted durable chat.",
+      );
+      return;
+    }
     const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
     const baseBranchForWorktree =
       isFirstMessage && envMode === "worktree" && !activeThread.worktreePath
@@ -2767,27 +2812,40 @@ export default function ChatView({ threadId }: ChatViewProps) {
 
       beginSendPhase("sending-turn");
       const turnAttachments = await turnAttachmentsPromise;
-      await api.orchestration.dispatchCommand({
-        type: "thread.turn.start",
-        commandId: newCommandId(),
-        threadId: threadIdForSend,
-        message: {
+      if (isSelfHosted) {
+        if (turnAttachments.length > 0) {
+          throw new Error("Image attachments are not yet supported in self-hosted durable chat.");
+        }
+        await startHostedAgentPromptTurn({
+          threadId: threadIdForSend,
           messageId: messageIdForSend,
-          role: "user",
           text: trimmed || IMAGE_ONLY_BOOTSTRAP_PROMPT,
-          attachments: turnAttachments,
-        },
-        model: selectedModel || undefined,
-        ...(selectedModelOptionsForDispatch
-          ? { modelOptions: selectedModelOptionsForDispatch }
-          : {}),
-        ...(providerOptionsForDispatch ? { providerOptions: providerOptionsForDispatch } : {}),
-        provider: selectedProvider,
-        assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
-        runtimeMode,
-        interactionMode,
-        createdAt: messageCreatedAt,
-      });
+          createdAt: messageCreatedAt,
+          interactionMode,
+        });
+      } else {
+        await api.orchestration.dispatchCommand({
+          type: "thread.turn.start",
+          commandId: newCommandId(),
+          threadId: threadIdForSend,
+          message: {
+            messageId: messageIdForSend,
+            role: "user",
+            text: trimmed || IMAGE_ONLY_BOOTSTRAP_PROMPT,
+            attachments: turnAttachments,
+          },
+          model: selectedModel || undefined,
+          ...(selectedModelOptionsForDispatch
+            ? { modelOptions: selectedModelOptionsForDispatch }
+            : {}),
+          ...(providerOptionsForDispatch ? { providerOptions: providerOptionsForDispatch } : {}),
+          provider: selectedProvider,
+          assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
+          runtimeMode,
+          interactionMode,
+          createdAt: messageCreatedAt,
+        });
+      }
       turnStartSucceeded = true;
     })().catch(async (err: unknown) => {
       if (createdServerThreadForLocalDraft && !turnStartSucceeded) {
@@ -2832,6 +2890,39 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const onInterrupt = async () => {
     const api = readNativeApi();
     if (!api || !activeThread) return;
+    if (isSelfHosted) {
+      if (!activeProject) {
+        return;
+      }
+      try {
+        const result = await api.jobs.list({
+          projectId: activeProject.id,
+          limit: 100,
+        });
+        const activeHostedJob =
+          result.jobs.find(
+            (job) =>
+              job.threadId === activeThread.id &&
+              ["queued", "starting", "running"].includes(job.status),
+          ) ?? null;
+        if (!activeHostedJob) {
+          toastManager.add({
+            type: "warning",
+            title: "No active hosted job",
+            description: "This thread does not have a running durable job to cancel.",
+          });
+          return;
+        }
+        await api.jobs.cancel({ jobId: activeHostedJob.id });
+      } catch (error) {
+        toastManager.add({
+          type: "error",
+          title: "Could not cancel hosted job",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        });
+      }
+      return;
+    }
     await api.orchestration.dispatchCommand({
       type: "thread.turn.interrupt",
       commandId: newCommandId(),
@@ -3041,27 +3132,37 @@ export default function ChatView({ threadId }: ChatViewProps) {
         // while the same-thread implementation turn is starting.
         setComposerDraftInteractionMode(threadIdForSend, nextInteractionMode);
 
-        await api.orchestration.dispatchCommand({
-          type: "thread.turn.start",
-          commandId: newCommandId(),
-          threadId: threadIdForSend,
-          message: {
+        if (isSelfHosted) {
+          await startHostedAgentPromptTurn({
+            threadId: threadIdForSend,
             messageId: messageIdForSend,
-            role: "user",
             text: trimmed,
-            attachments: [],
-          },
-          provider: selectedProvider,
-          model: selectedModel || undefined,
-          ...(selectedModelOptionsForDispatch
-            ? { modelOptions: selectedModelOptionsForDispatch }
-            : {}),
-          ...(providerOptionsForDispatch ? { providerOptions: providerOptionsForDispatch } : {}),
-          assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
-          runtimeMode,
-          interactionMode: nextInteractionMode,
-          createdAt: messageCreatedAt,
-        });
+            createdAt: messageCreatedAt,
+            interactionMode: nextInteractionMode,
+          });
+        } else {
+          await api.orchestration.dispatchCommand({
+            type: "thread.turn.start",
+            commandId: newCommandId(),
+            threadId: threadIdForSend,
+            message: {
+              messageId: messageIdForSend,
+              role: "user",
+              text: trimmed,
+              attachments: [],
+            },
+            provider: selectedProvider,
+            model: selectedModel || undefined,
+            ...(selectedModelOptionsForDispatch
+              ? { modelOptions: selectedModelOptionsForDispatch }
+              : {}),
+            ...(providerOptionsForDispatch ? { providerOptions: providerOptionsForDispatch } : {}),
+            assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
+            runtimeMode,
+            interactionMode: nextInteractionMode,
+            createdAt: messageCreatedAt,
+          });
+        }
         // Optimistically open the plan sidebar when implementing (not refining).
         // "default" mode here means the agent is executing the plan, which produces
         // step-tracking activities that the sidebar will display.
@@ -3092,6 +3193,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       persistThreadSettingsForNextTurn,
       resetSendPhase,
       runtimeMode,
+      isSelfHosted,
       selectedModel,
       selectedModelOptionsForDispatch,
       providerOptionsForDispatch,
@@ -3099,6 +3201,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       setComposerDraftInteractionMode,
       setThreadError,
       settings.enableAssistantStreaming,
+      startHostedAgentPromptTurn,
     ],
   );
 
@@ -3149,13 +3252,24 @@ export default function ChatView({ threadId }: ChatViewProps) {
         worktreePath: activeThread.worktreePath,
         createdAt,
       })
-      .then(() => {
-        return api.orchestration.dispatchCommand({
+      .then(async () => {
+        const messageId = newMessageId();
+        if (isSelfHosted) {
+          await startHostedAgentPromptTurn({
+            threadId: nextThreadId,
+            messageId,
+            text: implementationPrompt,
+            createdAt,
+            interactionMode: "default",
+          });
+          return;
+        }
+        await api.orchestration.dispatchCommand({
           type: "thread.turn.start",
           commandId: newCommandId(),
           threadId: nextThreadId,
           message: {
-            messageId: newMessageId(),
+            messageId,
             role: "user",
             text: implementationPrompt,
             attachments: [],
@@ -3212,6 +3326,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
     isConnecting,
     isSendBusy,
     isServerThread,
+    isSelfHosted,
     navigate,
     resetSendPhase,
     runtimeMode,
@@ -3220,6 +3335,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
     providerOptionsForDispatch,
     selectedProvider,
     settings.enableAssistantStreaming,
+    startHostedAgentPromptTurn,
     syncServerReadModel,
   ]);
 
@@ -3627,6 +3743,12 @@ export default function ChatView({ threadId }: ChatViewProps) {
               workspaceRoot={activeProject?.cwd ?? undefined}
             />
           </div>
+
+          {isSelfHosted && activeProject ? (
+            <Suspense fallback={null}>
+              <HostedJobsPanel projectId={activeProject.id} preferredThreadId={activeThread.id} />
+            </Suspense>
+          ) : null}
 
           {/* Input bar */}
           <div className={cn("px-3 pt-1.5 sm:px-5 sm:pt-2", isGitRepo ? "pb-1" : "pb-3 sm:pb-4")}>
@@ -4139,21 +4261,23 @@ export default function ChatView({ threadId }: ChatViewProps) {
 
         {/* Plan sidebar */}
         {planSidebarOpen ? (
-          <PlanSidebar
-            activePlan={activePlan}
-            activeProposedPlan={activeProposedPlan}
-            markdownCwd={gitCwd ?? undefined}
-            projectId={activeProject?.id ?? undefined}
-            workspaceRoot={activeProject?.cwd ?? undefined}
-            onClose={() => {
-              setPlanSidebarOpen(false);
-              // Track that the user explicitly dismissed for this turn so auto-open won't fight them.
-              const turnKey = activePlan?.turnId ?? activeProposedPlan?.turnId ?? null;
-              if (turnKey) {
-                planSidebarDismissedForTurnRef.current = turnKey;
-              }
-            }}
-          />
+          <Suspense fallback={null}>
+            <PlanSidebar
+              activePlan={activePlan}
+              activeProposedPlan={activeProposedPlan}
+              markdownCwd={gitCwd ?? undefined}
+              projectId={activeProject?.id ?? undefined}
+              workspaceRoot={activeProject?.cwd ?? undefined}
+              onClose={() => {
+                setPlanSidebarOpen(false);
+                // Track that the user explicitly dismissed for this turn so auto-open won't fight them.
+                const turnKey = activePlan?.turnId ?? activeProposedPlan?.turnId ?? null;
+                if (turnKey) {
+                  planSidebarDismissedForTurnRef.current = turnKey;
+                }
+              }}
+            />
+          </Suspense>
         ) : null}
       </div>
       {/* end horizontal flex container */}
@@ -4163,26 +4287,28 @@ export default function ChatView({ threadId }: ChatViewProps) {
           return null;
         }
         return (
-          <ThreadTerminalDrawer
-            key={activeThread.id}
-            threadId={activeThread.id}
-            cwd={gitCwd ?? activeProject.cwd}
-            runtimeEnv={threadTerminalRuntimeEnv}
-            height={terminalState.terminalHeight}
-            terminalIds={terminalState.terminalIds}
-            activeTerminalId={terminalState.activeTerminalId}
-            terminalGroups={terminalState.terminalGroups}
-            activeTerminalGroupId={terminalState.activeTerminalGroupId}
-            focusRequestId={terminalFocusRequestId}
-            onSplitTerminal={splitTerminal}
-            onNewTerminal={createNewTerminal}
-            splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
-            newShortcutLabel={newTerminalShortcutLabel ?? undefined}
-            closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
-            onActiveTerminalChange={activateTerminal}
-            onCloseTerminal={closeTerminal}
-            onHeightChange={setTerminalHeight}
-          />
+          <Suspense fallback={null}>
+            <ThreadTerminalDrawer
+              key={activeThread.id}
+              threadId={activeThread.id}
+              cwd={gitCwd ?? activeProject.cwd}
+              runtimeEnv={threadTerminalRuntimeEnv}
+              height={terminalState.terminalHeight}
+              terminalIds={terminalState.terminalIds}
+              activeTerminalId={terminalState.activeTerminalId}
+              terminalGroups={terminalState.terminalGroups}
+              activeTerminalGroupId={terminalState.activeTerminalGroupId}
+              focusRequestId={terminalFocusRequestId}
+              onSplitTerminal={splitTerminal}
+              onNewTerminal={createNewTerminal}
+              splitShortcutLabel={splitTerminalShortcutLabel ?? undefined}
+              newShortcutLabel={newTerminalShortcutLabel ?? undefined}
+              closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
+              onActiveTerminalChange={activateTerminal}
+              onCloseTerminal={closeTerminal}
+              onHeightChange={setTerminalHeight}
+            />
+          </Suspense>
         );
       })()}
 

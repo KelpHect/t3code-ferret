@@ -457,6 +457,34 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
+    case "thread.message.user.append": {
+      yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      return {
+        ...withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        }),
+        type: "thread.message-sent",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.message.messageId,
+          role: "user",
+          text: command.message.text,
+          attachments: command.message.attachments,
+          turnId: null,
+          streaming: false,
+          createdAt: command.createdAt,
+          updatedAt: command.createdAt,
+        },
+      };
+    }
+
     case "thread.message.assistant.delta": {
       yield* requireThread({
         readModel,

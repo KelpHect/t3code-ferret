@@ -1,0 +1,17 @@
+.git
+.github
+.turbo
+.vscode
+node_modules
+apps/*/node_modules
+packages/*/node_modules
+scripts/node_modules
+apps/*/dist
+apps/*/dist-electron
+packages/*/dist
+coverage
+playwright-report
+test-results
+tmp
+*.log
+

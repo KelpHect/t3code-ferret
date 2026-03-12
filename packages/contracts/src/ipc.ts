@@ -56,6 +56,7 @@ import type {
   HostedGitDiffResult,
   HostedGitStatus,
   HostedJob,
+  HostedJobEvent,
   HostedJobEventsInput,
   HostedJobEventsResult,
   HostedJobIdInput,
@@ -64,6 +65,7 @@ import type {
   HostedProject,
   HostedProjectCreateInput,
   HostedProjectCreateResult,
+  HostedProjectDeleteResult,
   HostedProjectFileListInput,
   HostedProjectFileListResult,
   HostedProjectFileReadInput,
@@ -167,6 +169,7 @@ export interface NativeApi {
     create: (input: HostedProjectCreateInput) => Promise<HostedProjectCreateResult>;
     get: (input: HostedProjectIdInput) => Promise<HostedProject>;
     archive: (input: HostedProjectIdInput) => Promise<HostedProject>;
+    delete: (input: HostedProjectIdInput) => Promise<HostedProjectDeleteResult>;
     listFiles: (input: HostedProjectFileListInput) => Promise<HostedProjectFileListResult>;
     readFile: (input: HostedProjectFileReadInput) => Promise<HostedProjectFileReadResult>;
     searchEntries: (
@@ -220,8 +223,11 @@ export interface NativeApi {
     list: (input: HostedJobListInput) => Promise<HostedJobListResult>;
     get: (input: HostedJobIdInput) => Promise<HostedJob>;
     events: (input: HostedJobEventsInput) => Promise<HostedJobEventsResult>;
+    cancel: (input: HostedJobIdInput) => Promise<HostedJob>;
     runCommand: (input: HostedRunCommandJobInput) => Promise<HostedJob>;
     agentPrompt: (input: HostedAgentPromptJobInput) => Promise<HostedJob>;
+    onEvent: (callback: (event: HostedJobEvent) => void) => () => void;
+    onUpdated: (callback: (job: HostedJob) => void) => () => void;
   };
   providers: {
     list: () => Promise<HostedProviderListResult>;

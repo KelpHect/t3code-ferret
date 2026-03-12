@@ -67,6 +67,7 @@ export const WS_METHODS = {
   projectsCreate: "projects.create",
   projectsGet: "projects.get",
   projectsArchive: "projects.archive",
+  projectsDelete: "projects.delete",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
   projectsFilesList: "projects.files.list",
@@ -107,6 +108,7 @@ export const WS_METHODS = {
   jobsList: "jobs.list",
   jobsGet: "jobs.get",
   jobsEvents: "jobs.events",
+  jobsCancel: "jobs.cancel",
   jobsRunCommand: "jobs.runCommand",
   jobsAgentPrompt: "jobs.agentPrompt",
 
@@ -160,6 +162,7 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.projectsCreate, HostedProjectCreateInput),
   tagRequestBody(WS_METHODS.projectsGet, HostedProjectIdInput),
   tagRequestBody(WS_METHODS.projectsArchive, HostedProjectIdInput),
+  tagRequestBody(WS_METHODS.projectsDelete, HostedProjectIdInput),
   tagRequestBody(WS_METHODS.projectsSearchEntries, ProjectSearchEntriesInput),
   tagRequestBody(WS_METHODS.projectsSearchEntries, HostedProjectSearchEntriesInput),
   tagRequestBody(WS_METHODS.projectsWriteFile, ProjectWriteFileInput),
@@ -202,6 +205,7 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.jobsList, HostedJobListInput),
   tagRequestBody(WS_METHODS.jobsGet, HostedJobIdInput),
   tagRequestBody(WS_METHODS.jobsEvents, HostedJobEventsInput),
+  tagRequestBody(WS_METHODS.jobsCancel, HostedJobIdInput),
   tagRequestBody(WS_METHODS.jobsRunCommand, HostedRunCommandJobInput),
   tagRequestBody(WS_METHODS.jobsAgentPrompt, HostedAgentPromptJobInput),
 

@@ -13,6 +13,7 @@ import { Route as ChatRouteImport } from './routes/_chat'
 import { Route as ChatIndexRouteImport } from './routes/_chat.index'
 import { Route as ProviderLoginSessionIdRouteImport } from './routes/provider-login.$sessionId'
 import { Route as ChatSettingsRouteImport } from './routes/_chat.settings'
+import { Route as ChatJobsRouteImport } from './routes/_chat.jobs'
 import { Route as ChatThreadIdRouteImport } from './routes/_chat.$threadId'
 
 const ChatRoute = ChatRouteImport.update({
@@ -34,6 +35,11 @@ const ChatSettingsRoute = ChatSettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => ChatRoute,
 } as any)
+const ChatJobsRoute = ChatJobsRouteImport.update({
+  id: '/jobs',
+  path: '/jobs',
+  getParentRoute: () => ChatRoute,
+} as any)
 const ChatThreadIdRoute = ChatThreadIdRouteImport.update({
   id: '/$threadId',
   path: '/$threadId',
@@ -43,11 +49,13 @@ const ChatThreadIdRoute = ChatThreadIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
   '/$threadId': typeof ChatThreadIdRoute
+  '/jobs': typeof ChatJobsRoute
   '/settings': typeof ChatSettingsRoute
   '/provider-login/$sessionId': typeof ProviderLoginSessionIdRoute
 }
 export interface FileRoutesByTo {
   '/$threadId': typeof ChatThreadIdRoute
+  '/jobs': typeof ChatJobsRoute
   '/settings': typeof ChatSettingsRoute
   '/provider-login/$sessionId': typeof ProviderLoginSessionIdRoute
   '/': typeof ChatIndexRoute
@@ -56,19 +64,26 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_chat': typeof ChatRouteWithChildren
   '/_chat/$threadId': typeof ChatThreadIdRoute
+  '/_chat/jobs': typeof ChatJobsRoute
   '/_chat/settings': typeof ChatSettingsRoute
   '/provider-login/$sessionId': typeof ProviderLoginSessionIdRoute
   '/_chat/': typeof ChatIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/$threadId' | '/settings' | '/provider-login/$sessionId'
+  fullPaths:
+    | '/'
+    | '/$threadId'
+    | '/jobs'
+    | '/settings'
+    | '/provider-login/$sessionId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/$threadId' | '/settings' | '/provider-login/$sessionId' | '/'
+  to: '/$threadId' | '/jobs' | '/settings' | '/provider-login/$sessionId' | '/'
   id:
     | '__root__'
     | '/_chat'
     | '/_chat/$threadId'
+    | '/_chat/jobs'
     | '/_chat/settings'
     | '/provider-login/$sessionId'
     | '/_chat/'
@@ -109,6 +124,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatSettingsRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/_chat/jobs': {
+      id: '/_chat/jobs'
+      path: '/jobs'
+      fullPath: '/jobs'
+      preLoaderRoute: typeof ChatJobsRouteImport
+      parentRoute: typeof ChatRoute
+    }
     '/_chat/$threadId': {
       id: '/_chat/$threadId'
       path: '/$threadId'
@@ -121,12 +143,14 @@ declare module '@tanstack/react-router' {
 
 interface ChatRouteChildren {
   ChatThreadIdRoute: typeof ChatThreadIdRoute
+  ChatJobsRoute: typeof ChatJobsRoute
   ChatSettingsRoute: typeof ChatSettingsRoute
   ChatIndexRoute: typeof ChatIndexRoute
 }
 
 const ChatRouteChildren: ChatRouteChildren = {
   ChatThreadIdRoute: ChatThreadIdRoute,
+  ChatJobsRoute: ChatJobsRoute,
   ChatSettingsRoute: ChatSettingsRoute,
   ChatIndexRoute: ChatIndexRoute,
 }
