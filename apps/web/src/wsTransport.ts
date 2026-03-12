@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import { decodeUnknownJsonResult, formatSchemaError } from "@t3tools/shared/schemaJson";
 import { Result, Schema } from "effect";
+import { getRuntimePublicConfig } from "./runtimeConfig";
 
 type PushListener<C extends WsPushChannel> = (message: WsPushMessage<C>) => void;
 
@@ -62,13 +63,17 @@ export class WsTransport {
   constructor(url?: string) {
     const bridgeUrl = window.desktopBridge?.getWsUrl();
     const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
+    const runtimeConfig = getRuntimePublicConfig();
+    const sameOriginWsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}`;
     this.url =
       url ??
-      (bridgeUrl && bridgeUrl.length > 0
-        ? bridgeUrl
-        : envUrl && envUrl.length > 0
-          ? envUrl
-          : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:${window.location.port}`);
+      (runtimeConfig.deploymentMode === "self-hosted"
+        ? sameOriginWsUrl
+        : bridgeUrl && bridgeUrl.length > 0
+          ? bridgeUrl
+          : envUrl && envUrl.length > 0
+            ? envUrl
+            : sameOriginWsUrl);
     this.connect();
   }
 

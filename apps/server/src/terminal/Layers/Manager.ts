@@ -53,27 +53,22 @@ function defaultShellResolver(): string {
   return process.env.SHELL ?? "bash";
 }
 
-function normalizeShellCommand(value: string | undefined): string | null {
+function splitShellCommand(value: string): string[] {
+  const matches = value.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  return matches.map((part) => part.replace(/^['"]|['"]$/g, ""));
+}
+
+function parseShellCandidate(value: string | undefined): ShellCandidate | null {
   if (!value) return null;
   const trimmed = value.trim();
   if (trimmed.length === 0) return null;
-
-  if (process.platform === "win32") {
-    return trimmed;
-  }
-
-  const firstToken = trimmed.split(/\s+/g)[0]?.trim();
-  if (!firstToken) return null;
-  return firstToken.replace(/^['"]|['"]$/g, "");
-}
-
-function shellCandidateFromCommand(command: string | null): ShellCandidate | null {
-  if (!command || command.length === 0) return null;
-  const shellName = path.basename(command).toLowerCase();
+  const [shell, ...args] = splitShellCommand(trimmed);
+  if (!shell) return null;
+  const shellName = path.basename(shell).toLowerCase();
   if (process.platform !== "win32" && shellName === "zsh") {
-    return { shell: command, args: ["-o", "nopromptsp"] };
+    return { shell, args: ["-o", "nopromptsp", ...args] };
   }
-  return { shell: command };
+  return args.length > 0 ? { shell, args } : { shell };
 }
 
 function formatShellCandidate(candidate: ShellCandidate): string {
@@ -95,26 +90,26 @@ function uniqueShellCandidates(candidates: Array<ShellCandidate | null>): ShellC
 }
 
 function resolveShellCandidates(shellResolver: () => string): ShellCandidate[] {
-  const requested = shellCandidateFromCommand(normalizeShellCommand(shellResolver()));
+  const requested = parseShellCandidate(shellResolver());
 
   if (process.platform === "win32") {
     return uniqueShellCandidates([
       requested,
-      shellCandidateFromCommand(process.env.ComSpec ?? null),
-      shellCandidateFromCommand("powershell.exe"),
-      shellCandidateFromCommand("cmd.exe"),
+      parseShellCandidate(process.env.ComSpec),
+      parseShellCandidate("powershell.exe"),
+      parseShellCandidate("cmd.exe"),
     ]);
   }
 
   return uniqueShellCandidates([
     requested,
-    shellCandidateFromCommand(normalizeShellCommand(process.env.SHELL)),
-    shellCandidateFromCommand("/bin/zsh"),
-    shellCandidateFromCommand("/bin/bash"),
-    shellCandidateFromCommand("/bin/sh"),
-    shellCandidateFromCommand("zsh"),
-    shellCandidateFromCommand("bash"),
-    shellCandidateFromCommand("sh"),
+    parseShellCandidate(process.env.SHELL),
+    parseShellCandidate("/bin/zsh"),
+    parseShellCandidate("/bin/bash"),
+    parseShellCandidate("/bin/sh"),
+    parseShellCandidate("zsh"),
+    parseShellCandidate("bash"),
+    parseShellCandidate("sh"),
   ]);
 }
 

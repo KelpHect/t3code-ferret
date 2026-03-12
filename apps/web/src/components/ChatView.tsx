@@ -177,6 +177,7 @@ import {
   Zed,
 } from "./Icons";
 import { cn, isMacPlatform, isWindowsPlatform, randomUUID } from "~/lib/utils";
+import { getRuntimePublicConfig } from "../runtimeConfig";
 import { Badge } from "./ui/badge";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { Command, CommandItem, CommandList } from "./ui/command";
@@ -1271,6 +1272,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const serverConfigQuery = useQuery(serverConfigQueryOptions());
   const workspaceEntriesQuery = useQuery(
     projectSearchEntriesQueryOptions({
+      projectId: activeProject?.id ?? null,
       cwd: gitCwd,
       query: effectivePathQuery,
       enabled: isPathTrigger,
@@ -3621,6 +3623,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
               onImageExpand={onExpandTimelineImage}
               markdownCwd={gitCwd ?? undefined}
               resolvedTheme={resolvedTheme}
+              projectId={activeProject?.id ?? undefined}
               workspaceRoot={activeProject?.cwd ?? undefined}
             />
           </div>
@@ -4140,6 +4143,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
             activePlan={activePlan}
             activeProposedPlan={activeProposedPlan}
             markdownCwd={gitCwd ?? undefined}
+            projectId={activeProject?.id ?? undefined}
             workspaceRoot={activeProject?.cwd ?? undefined}
             onClose={() => {
               setPlanSidebarOpen(false);
@@ -4865,10 +4869,12 @@ const ChangedFilesTree = memo(function ChangedFilesTree(props: {
 const ProposedPlanCard = memo(function ProposedPlanCard({
   planMarkdown,
   cwd,
+  projectId,
   workspaceRoot,
 }: {
   planMarkdown: string;
   cwd: string | undefined;
+  projectId: ProjectId | undefined;
   workspaceRoot: string | undefined;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -4891,11 +4897,17 @@ const ProposedPlanCard = memo(function ProposedPlanCard({
   };
 
   const openSaveDialog = () => {
-    if (!workspaceRoot) {
+    const runtimeConfig = getRuntimePublicConfig();
+    const missingSaveTarget =
+      runtimeConfig.deploymentMode === "self-hosted" ? !projectId : !workspaceRoot;
+    if (missingSaveTarget) {
       toastManager.add({
         type: "error",
         title: "Workspace path is unavailable",
-        description: "This thread does not have a workspace path to save into.",
+        description:
+          runtimeConfig.deploymentMode === "self-hosted"
+            ? "This thread is not bound to a hosted project."
+            : "This thread does not have a workspace path to save into.",
       });
       return;
     }
@@ -4906,7 +4918,8 @@ const ProposedPlanCard = memo(function ProposedPlanCard({
   const handleSaveToWorkspace = () => {
     const api = readNativeApi();
     const relativePath = savePath.trim();
-    if (!api || !workspaceRoot) {
+    const runtimeConfig = getRuntimePublicConfig();
+    if (!api) {
       return;
     }
     if (!relativePath) {
@@ -4918,18 +4931,35 @@ const ProposedPlanCard = memo(function ProposedPlanCard({
     }
 
     setIsSavingToWorkspace(true);
-    void api.projects
-      .writeFile({
+    let saveOperation: ReturnType<typeof api.projects.writeFile>;
+    if (runtimeConfig.deploymentMode === "self-hosted") {
+      if (!projectId) {
+        setIsSavingToWorkspace(false);
+        return;
+      }
+      saveOperation = api.projects.writeFile({
+        projectId,
+        path: relativePath,
+        contents: saveContents,
+      });
+    } else {
+      if (!workspaceRoot) {
+        setIsSavingToWorkspace(false);
+        return;
+      }
+      saveOperation = api.projects.writeFile({
         cwd: workspaceRoot,
         relativePath,
         contents: saveContents,
-      })
+      });
+    }
+    void saveOperation
       .then((result) => {
         setIsSaveDialogOpen(false);
         toastManager.add({
           type: "success",
           title: "Plan saved to workspace",
-          description: result.relativePath,
+          description: "path" in result ? result.path : result.relativePath,
         });
       })
       .catch((error) => {
@@ -5066,6 +5096,7 @@ interface MessagesTimelineProps {
   onImageExpand: (preview: ExpandedImagePreview) => void;
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
+  projectId: ProjectId | undefined;
   workspaceRoot: string | undefined;
 }
 
@@ -5120,6 +5151,7 @@ const MessagesTimeline = memo(function MessagesTimeline({
   onImageExpand,
   markdownCwd,
   resolvedTheme,
+  projectId,
   workspaceRoot,
 }: MessagesTimelineProps) {
   const timelineRootRef = useRef<HTMLDivElement | null>(null);
@@ -5575,6 +5607,7 @@ const MessagesTimeline = memo(function MessagesTimeline({
           <ProposedPlanCard
             planMarkdown={row.proposedPlan.planMarkdown}
             cwd={markdownCwd}
+            projectId={projectId}
             workspaceRoot={workspaceRoot}
           />
         </div>

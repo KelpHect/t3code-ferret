@@ -37,6 +37,10 @@ export function DiffWorkerPoolProvider({ children }: { children?: ReactNode }) {
     return Math.max(2, Math.min(6, Math.floor(cores / 2)));
   }, []);
 
+  if (import.meta.env.MODE === "test") {
+    return <>{children}</>;
+  }
+
   return (
     <WorkerPoolContextProvider
       poolOptions={{

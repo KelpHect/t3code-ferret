@@ -7,24 +7,29 @@
  * @module Server
  */
 import http from "node:http";
-import type { Duplex } from "node:stream";
 
 import Mime from "@effect/platform-node/Mime";
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  type DeploymentMode,
   type ClientOrchestrationCommand,
+  type HostedProviderAccount,
+  type RuntimePublicConfig,
   type OrchestrationCommand,
   ORCHESTRATION_WS_CHANNELS,
   ORCHESTRATION_WS_METHODS,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   ProjectId,
+  type ServerViewer,
   ThreadId,
   WS_CHANNELS,
   WS_METHODS,
   WebSocketRequest,
   type WsResponse as WsResponseMessage,
   WsResponse,
+  type WsPushChannel,
+  type WsPushData,
   type WsPushEnvelopeBase,
 } from "@t3tools/contracts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
@@ -41,7 +46,6 @@ import {
   Scope,
   ServiceMap,
   Stream,
-  Struct,
 } from "effect";
 import { WebSocketServer, type WebSocket } from "ws";
 
@@ -78,6 +82,9 @@ import { expandHomePath } from "./os-jank.ts";
 import { makeServerPushBus } from "./wsServer/pushBus.ts";
 import { makeServerReadiness } from "./wsServer/readiness.ts";
 import { decodeJsonResult, formatSchemaError } from "@t3tools/shared/schemaJson";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { HostedRuntime, type HostedUser } from "./hostedRuntime";
+import { resolveViewerFromRequest, SelfHostedAuthError } from "./selfHostedAuth";
 
 /**
  * ServerShape - Service API for server lifecycle control.
@@ -109,17 +116,6 @@ const isServerNotRunningError = (error: Error): boolean => {
     maybeCode === "ERR_SERVER_NOT_RUNNING" || error.message.toLowerCase().includes("not running")
   );
 };
-
-function rejectUpgrade(socket: Duplex, statusCode: number, message: string): void {
-  socket.end(
-    `HTTP/1.1 ${statusCode} ${statusCode === 401 ? "Unauthorized" : "Bad Request"}\r\n` +
-      "Connection: close\r\n" +
-      "Content-Type: text/plain\r\n" +
-      `Content-Length: ${Buffer.byteLength(message)}\r\n` +
-      "\r\n" +
-      message,
-  );
-}
 
 function websocketRawToString(raw: unknown): string | null {
   if (typeof raw === "string") {
@@ -195,8 +191,89 @@ function resolveWorkspaceWritePath(params: {
   });
 }
 
-function stripRequestTag<T extends { _tag: string }>(body: T) {
-  return Struct.omit(body, ["_tag"]);
+function stripRequestTag<T extends { _tag: string }>(body: T): Omit<T, "_tag"> {
+  const { _tag: _ignored, ...rest } = body;
+  return rest;
+}
+
+type WebSocketRequestBody = WebSocketRequest["body"];
+
+function requestBodyForTag<Tag extends WebSocketRequestBody["_tag"]>(
+  request: WebSocketRequest,
+  _tag: Tag,
+): Extract<WebSocketRequestBody, { _tag: Tag }> {
+  return request.body as Extract<WebSocketRequestBody, { _tag: Tag }>;
+}
+
+function getStringField(value: unknown, key: string): string | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "string" ? candidate : null;
+}
+
+function toHostedUser(viewer: ServerViewer): HostedUser {
+  return {
+    userId: viewer.userId,
+    email: viewer.email,
+    displayName: viewer.displayName,
+  };
+}
+
+function runtimePublicConfigFromServerConfig(config: {
+  readonly deploymentMode: DeploymentMode;
+  readonly clerkPublishableKey: string | undefined;
+}): RuntimePublicConfig {
+  return {
+    deploymentMode: config.deploymentMode,
+    authProvider:
+      config.deploymentMode === "self-hosted" && config.clerkPublishableKey
+        ? {
+            kind: "clerk",
+            publishableKey: config.clerkPublishableKey,
+          }
+        : null,
+    featureFlags: {
+      hostedProjects: config.deploymentMode === "self-hosted",
+      perUserProviders: config.deploymentMode === "self-hosted",
+      localWorkspaceRegistration: config.deploymentMode === "local",
+    },
+  };
+}
+
+function localCapabilitiesForDeploymentMode(deploymentMode: DeploymentMode) {
+  const enabled = deploymentMode === "local";
+  return {
+    workspaceRegistration: enabled,
+    cwdRouting: enabled,
+    worktrees: enabled,
+    stackedGitActions: enabled,
+    pullRequestThreads: enabled,
+  };
+}
+
+function serverProviderStatusesFromHostedAccounts(accounts: ReadonlyArray<HostedProviderAccount>) {
+  return accounts.map((account) => ({
+    provider: account.provider,
+    available: true,
+    checkedAt: account.updatedAt,
+    message: account.message ?? undefined,
+    authStatus:
+      account.status === "authenticated"
+        ? "authenticated"
+        : account.status === "unauthenticated"
+          ? "unauthenticated"
+          : "unknown",
+    status:
+      account.status === "authenticated"
+        ? "ready"
+        : account.status === "unauthenticated"
+          ? "error"
+          : account.status === "running_login"
+            ? "warning"
+            : "warning",
+  }));
 }
 
 const encodeWsResponse = Schema.encodeEffect(Schema.fromJsonString(WsResponse));
@@ -217,7 +294,8 @@ export type ServerRuntimeServices =
   | TerminalManager
   | Keybindings
   | Open
-  | AnalyticsService;
+  | AnalyticsService
+  | SqlClient.SqlClient;
 
 export class ServerLifecycleError extends Schema.TaggedErrorClass<ServerLifecycleError>()(
   "ServerLifecycleError",
@@ -238,12 +316,12 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
 > {
   const serverConfig = yield* ServerConfig;
   const {
+    deploymentMode,
     port,
     cwd,
     keybindingsConfigPath,
     staticDir,
     devUrl,
-    authToken,
     host,
     logWebSocketEvents,
     autoBootstrapProjectFromCwd,
@@ -255,8 +333,11 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const keybindingsManager = yield* Keybindings;
   const providerHealth = yield* ProviderHealth;
   const git = yield* GitCore;
+  const sql = yield* SqlClient.SqlClient;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const runtimePublicConfig = runtimePublicConfigFromServerConfig(serverConfig);
+  const localCapabilities = localCapabilitiesForDeploymentMode(deploymentMode);
 
   yield* keybindingsManager.syncDefaultKeybindingsOnStartup.pipe(
     Effect.catch((error) =>
@@ -271,6 +352,8 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const providerStatuses = yield* providerHealth.getStatuses;
 
   const clients = yield* Ref.make(new Set<WebSocket>());
+  const requestViewerMap = new WeakMap<http.IncomingMessage, ServerViewer | null>();
+  const clientViewerMap = new Map<WebSocket, ServerViewer | null>();
   const logger = createLogger("ws");
   const readiness = yield* makeServerReadiness;
 
@@ -288,6 +371,18 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     clients,
     logOutgoingPush,
   });
+  const publishToViewer = <C extends WsPushChannel>(
+    userId: string,
+    channel: C,
+    data: WsPushData<C>,
+  ) =>
+    Effect.forEach(
+      [...clientViewerMap.entries()]
+        .filter(([, viewer]) => viewer?.userId === userId)
+        .map(([client]) => client),
+      (client) => pushBus.publishClient(client, channel, data),
+      { concurrency: "unbounded" },
+    ).pipe(Effect.asVoid);
   yield* readiness.markPushBusReady;
   yield* keybindingsManager.start.pipe(
     Effect.mapError(
@@ -424,6 +519,34 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     void Effect.runPromise(
       Effect.gen(function* () {
         const url = new URL(req.url ?? "/", `http://localhost:${port}`);
+        if (url.pathname === "/api/runtime-config") {
+          respond(
+            200,
+            { "Content-Type": "application/json; charset=utf-8" },
+            JSON.stringify(runtimePublicConfig),
+          );
+          return;
+        }
+
+        if (url.pathname === "/health/live") {
+          respond(
+            200,
+            { "Content-Type": "application/json; charset=utf-8" },
+            JSON.stringify({ ok: true }),
+          );
+          return;
+        }
+
+        if (url.pathname === "/health/ready") {
+          const ready = yield* readiness.isServerReady;
+          respond(
+            ready ? 200 : 503,
+            { "Content-Type": "application/json; charset=utf-8" },
+            JSON.stringify({ ok: ready }),
+          );
+          return;
+        }
+
         if (tryHandleProjectFaviconRequest(url, res)) {
           return;
         }
@@ -604,11 +727,63 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const orchestrationReactor = yield* OrchestrationReactor;
   const { openInEditor } = yield* Open;
 
+  const runtimeServices = yield* Effect.services<
+    ServerRuntimeServices | ServerConfig | FileSystem.FileSystem | Path.Path
+  >();
+  const runPromise = Effect.runPromiseWith(runtimeServices);
+  const hostedRuntime = new HostedRuntime({
+    sql,
+    config: serverConfig,
+    git,
+    terminalManager,
+    orchestrationEngine,
+    projectionSnapshotQuery: projectionReadModelQuery,
+    runEffect: runPromise,
+    publishJobEvent: (ownerClerkUserId, event) =>
+      runPromise(publishToViewer(ownerClerkUserId, WS_CHANNELS.jobEvent, event)),
+    publishJobUpdated: (ownerClerkUserId, job) =>
+      runPromise(publishToViewer(ownerClerkUserId, WS_CHANNELS.jobUpdated, job)),
+  });
+  yield* Effect.tryPromise({
+    try: () => hostedRuntime.bootstrap(),
+    catch: (cause) => new ServerLifecycleError({ operation: "hostedRuntimeBootstrap", cause }),
+  });
+  yield* readiness.markHostedBootstrapReady;
+
   const subscriptionsScope = yield* Scope.make("sequential");
   yield* Effect.addFinalizer(() => Scope.close(subscriptionsScope, Exit.void));
 
+  const findEventOwner = async (event: { payload: Record<string, unknown> }) => {
+    const projectId = typeof event.payload.projectId === "string" ? event.payload.projectId : null;
+    if (projectId) {
+      return hostedRuntime.getProjectOwnerByProjectId(projectId);
+    }
+    const threadId = typeof event.payload.threadId === "string" ? event.payload.threadId : null;
+    if (threadId) {
+      return hostedRuntime.getProjectOwnerByThreadId(threadId);
+    }
+    return null;
+  };
+
   yield* Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) =>
-    pushBus.publishAll(ORCHESTRATION_WS_CHANNELS.domainEvent, event),
+    Effect.tryPromise({
+      try: async () => {
+        if (deploymentMode === "self-hosted") {
+          const owner = await findEventOwner(event as { payload: Record<string, unknown> });
+          if (owner) {
+            await runPromise(publishToViewer(owner, ORCHESTRATION_WS_CHANNELS.domainEvent, event));
+          }
+          return;
+        }
+        await runPromise(pushBus.publishAll(ORCHESTRATION_WS_CHANNELS.domainEvent, event));
+      },
+      catch: (cause) => new ServerLifecycleError({ operation: "orchestrationEventFanout", cause }),
+    }).pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("failed to fan out orchestration event", { cause }),
+      ),
+      Effect.asVoid,
+    ),
   ).pipe(Effect.forkIn(subscriptionsScope));
 
   yield* Stream.runForEach(keybindingsManager.streamChanges, (event) =>
@@ -684,14 +859,26 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     );
   }
 
-  const runtimeServices = yield* Effect.services<
-    ServerRuntimeServices | ServerConfig | FileSystem.FileSystem | Path.Path
-  >();
-  const runPromise = Effect.runPromiseWith(runtimeServices);
-
-  const unsubscribeTerminalEvents = yield* terminalManager.subscribe(
-    (event) => void Effect.runPromise(pushBus.publishAll(WS_CHANNELS.terminalEvent, event)),
-  );
+  const unsubscribeTerminalEvents = yield* terminalManager.subscribe((event) => {
+    void runPromise(
+      deploymentMode === "self-hosted"
+        ? Effect.tryPromise({
+            try: async () => {
+              const owner = await hostedRuntime.getProjectOwnerByTerminalThreadId(event.threadId);
+              if (owner) {
+                await runPromise(publishToViewer(owner, WS_CHANNELS.terminalEvent, event));
+              }
+            },
+            catch: (cause) => new ServerLifecycleError({ operation: "terminalEventFanout", cause }),
+          }).pipe(
+            Effect.catch((cause) =>
+              Effect.logWarning("failed to fan out terminal event", { cause }),
+            ),
+            Effect.asVoid,
+          )
+        : pushBus.publishAll(WS_CHANNELS.terminalEvent, event),
+    );
+  });
   yield* Effect.addFinalizer(() => Effect.sync(() => unsubscribeTerminalEvents()));
   yield* readiness.markTerminalSubscriptionsReady;
 
@@ -704,43 +891,264 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     Effect.all([closeAllClients, closeWebSocketServer.pipe(Effect.ignoreCause({ log: true }))]),
   );
 
-  const routeRequest = Effect.fnUntraced(function* (request: WebSocketRequest) {
+  const getHostedViewer = Effect.fn(function* (viewer: ServerViewer | null) {
+    if (!viewer) {
+      return yield* new RouteRequestError({
+        message: "Authentication required.",
+      });
+    }
+    return toHostedUser(viewer);
+  });
+
+  const getSnapshotForViewer = Effect.fn(function* (viewer: ServerViewer | null) {
+    const snapshot = yield* projectionReadModelQuery.getSnapshot();
+    if (deploymentMode !== "self-hosted" || !viewer) {
+      return snapshot;
+    }
+    const ownedProjects = new Set(
+      (yield* Effect.promise(() => hostedRuntime.listProjects(toHostedUser(viewer)))).map(
+        (project) => project.id,
+      ),
+    );
+    const threads = snapshot.threads.filter((thread) => ownedProjects.has(thread.projectId));
+    const threadIds = new Set(threads.map((thread) => thread.id));
+    return {
+      ...snapshot,
+      projects: snapshot.projects.filter((project) => ownedProjects.has(project.id)),
+      threads: threads.filter((thread) => threadIds.has(thread.id)),
+    };
+  });
+
+  const assertViewerOwnsProject = Effect.fn(function* (
+    viewer: ServerViewer | null,
+    projectId: string,
+  ) {
+    if (deploymentMode !== "self-hosted") {
+      return;
+    }
+    const hostedViewer = yield* getHostedViewer(viewer);
+    const owner = yield* Effect.promise(() => hostedRuntime.getProjectOwnerByProjectId(projectId));
+    if (!owner || owner !== hostedViewer.userId) {
+      return yield* new RouteRequestError({
+        message: "Project not found.",
+      });
+    }
+  });
+
+  const assertViewerOwnsThread = Effect.fn(function* (
+    viewer: ServerViewer | null,
+    threadId: string,
+  ) {
+    if (deploymentMode !== "self-hosted") {
+      return;
+    }
+    const hostedViewer = yield* getHostedViewer(viewer);
+    const owner = yield* Effect.promise(() => hostedRuntime.getProjectOwnerByThreadId(threadId));
+    if (!owner || owner !== hostedViewer.userId) {
+      return yield* new RouteRequestError({
+        message: "Thread not found.",
+      });
+    }
+  });
+
+  const assertViewerOwnsTerminalThread = Effect.fn(function* (
+    viewer: ServerViewer | null,
+    threadId: string,
+  ) {
+    if (deploymentMode !== "self-hosted") {
+      return;
+    }
+    const hostedViewer = yield* getHostedViewer(viewer);
+    const owner = yield* Effect.promise(() =>
+      hostedRuntime.getProjectOwnerByTerminalThreadId(threadId),
+    );
+    if (!owner || owner !== hostedViewer.userId) {
+      return yield* new RouteRequestError({
+        message: "Terminal not found.",
+      });
+    }
+  });
+
+  const authorizeOrchestrationCommand = Effect.fn(function* (
+    viewer: ServerViewer | null,
+    command: OrchestrationCommand,
+  ) {
+    if (deploymentMode !== "self-hosted") {
+      return command;
+    }
+
+    switch (command.type) {
+      case "project.create":
+        return yield* new RouteRequestError({
+          message:
+            "Direct project.create commands are disabled in self-hosted mode. Use projects.create instead.",
+        });
+
+      case "project.meta.update":
+        if (command.workspaceRoot !== undefined) {
+          return yield* new RouteRequestError({
+            message: "Project workspace roots are server-managed in self-hosted mode.",
+          });
+        }
+      case "project.delete":
+        yield* assertViewerOwnsProject(viewer, command.projectId);
+        return command;
+
+      case "thread.create":
+        yield* assertViewerOwnsProject(viewer, command.projectId);
+        if (command.worktreePath !== null) {
+          return yield* new RouteRequestError({
+            message: "Git worktrees are local-only in self-hosted mode.",
+          });
+        }
+        return command;
+
+      case "thread.runtime-mode.set":
+      case "thread.interaction-mode.set":
+      case "thread.delete":
+        yield* assertViewerOwnsThread(viewer, command.threadId);
+        return command;
+
+      case "thread.meta.update":
+        if (command.worktreePath !== undefined) {
+          return yield* new RouteRequestError({
+            message: "Git worktree mutations are local-only in self-hosted mode.",
+          });
+        }
+        yield* assertViewerOwnsThread(viewer, command.threadId);
+        return command;
+
+      case "thread.turn.start":
+      case "thread.turn.interrupt":
+      case "thread.approval.respond":
+      case "thread.user-input.respond":
+      case "thread.session.stop":
+      case "thread.checkpoint.revert":
+        yield* assertViewerOwnsThread(viewer, command.threadId);
+        if (command.type !== "thread.turn.start") {
+          return command;
+        }
+        const hostedViewer = yield* getHostedViewer(viewer);
+        const codexHome = yield* Effect.promise(() =>
+          hostedRuntime.requireAuthenticatedProviderHome(hostedViewer, "codex"),
+        );
+        return {
+          ...command,
+          providerOptions: {
+            ...command.providerOptions,
+            codex: {
+              ...command.providerOptions?.codex,
+              homePath: codexHome,
+            },
+          },
+        } satisfies OrchestrationCommand;
+
+      default:
+        return command;
+    }
+  });
+
+  const routeRequest = Effect.fnUntraced(function* (
+    request: WebSocketRequest,
+    viewer: ServerViewer | null,
+  ) {
     switch (request.body._tag) {
       case ORCHESTRATION_WS_METHODS.getSnapshot:
-        return yield* projectionReadModelQuery.getSnapshot();
+        return yield* getSnapshotForViewer(viewer);
 
       case ORCHESTRATION_WS_METHODS.dispatchCommand: {
         const { command } = request.body;
         const normalizedCommand = yield* normalizeDispatchCommand({ command });
-        return yield* orchestrationEngine.dispatch(normalizedCommand);
+        const authorizedCommand = yield* authorizeOrchestrationCommand(viewer, normalizedCommand);
+        return yield* orchestrationEngine.dispatch(authorizedCommand);
       }
 
       case ORCHESTRATION_WS_METHODS.getTurnDiff: {
-        const body = stripRequestTag(request.body);
+        const body = stripRequestTag(
+          requestBodyForTag(request, ORCHESTRATION_WS_METHODS.getTurnDiff),
+        );
+        if (deploymentMode === "self-hosted") {
+          yield* assertViewerOwnsThread(viewer, body.threadId);
+        }
         return yield* checkpointDiffQuery.getTurnDiff(body);
       }
 
       case ORCHESTRATION_WS_METHODS.getFullThreadDiff: {
-        const body = stripRequestTag(request.body);
+        const body = stripRequestTag(
+          requestBodyForTag(request, ORCHESTRATION_WS_METHODS.getFullThreadDiff),
+        );
+        if (deploymentMode === "self-hosted") {
+          yield* assertViewerOwnsThread(viewer, body.threadId);
+        }
         return yield* checkpointDiffQuery.getFullThreadDiff(body);
       }
 
       case ORCHESTRATION_WS_METHODS.replayEvents: {
         const { fromSequenceExclusive } = request.body;
-        return yield* Stream.runCollect(
+        const events = yield* Stream.runCollect(
           orchestrationEngine.readEvents(
             clamp(fromSequenceExclusive, {
               maximum: Number.MAX_SAFE_INTEGER,
               minimum: 0,
             }),
           ),
-        ).pipe(Effect.map((events) => Array.from(events)));
+        ).pipe(Effect.map((collected) => Array.from(collected)));
+        if (deploymentMode !== "self-hosted" || !viewer) {
+          return events;
+        }
+        const filtered = yield* Effect.promise(async () => {
+          const next = [];
+          for (const event of events) {
+            const projectId = getStringField(event.payload, "projectId");
+            const threadId = getStringField(event.payload, "threadId");
+            const owner = await (projectId
+              ? hostedRuntime.getProjectOwnerByProjectId(projectId)
+              : threadId
+                ? hostedRuntime.getProjectOwnerByThreadId(threadId)
+                : Promise.resolve(null));
+            if (owner === viewer.userId) {
+              next.push(event);
+            }
+          }
+          return next;
+        });
+        return filtered;
       }
 
       case WS_METHODS.projectsSearchEntries: {
-        const body = stripRequestTag(request.body);
+        const body = requestBodyForTag(request, WS_METHODS.projectsSearchEntries);
+        if ("projectId" in body) {
+          if (deploymentMode !== "self-hosted") {
+            return yield* new RouteRequestError({
+              message: "Hosted project file search is only available in self-hosted mode.",
+            });
+          }
+          const hostedViewer = yield* getHostedViewer(viewer);
+          return yield* Effect.tryPromise({
+            try: () =>
+              hostedRuntime.searchProjectEntries(hostedViewer, {
+                projectId: body.projectId,
+                query: body.query,
+                limit: body.limit,
+              }),
+            catch: (cause) =>
+              new RouteRequestError({
+                message: `Failed to search hosted project entries: ${String(cause)}`,
+              }),
+          });
+        }
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Workspace entry search by cwd is local-only in self-hosted mode.",
+          });
+        }
         return yield* Effect.tryPromise({
-          try: () => searchWorkspaceEntries(body),
+          try: () =>
+            searchWorkspaceEntries({
+              cwd: body.cwd,
+              query: body.query,
+              limit: body.limit,
+            }),
           catch: (cause) =>
             new RouteRequestError({
               message: `Failed to search workspace entries: ${String(cause)}`,
@@ -749,7 +1157,32 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
       }
 
       case WS_METHODS.projectsWriteFile: {
-        const body = stripRequestTag(request.body);
+        const body = requestBodyForTag(request, WS_METHODS.projectsWriteFile);
+        if ("projectId" in body) {
+          if (deploymentMode !== "self-hosted") {
+            return yield* new RouteRequestError({
+              message: "Hosted project file writes are only available in self-hosted mode.",
+            });
+          }
+          const hostedViewer = yield* getHostedViewer(viewer);
+          return yield* Effect.tryPromise({
+            try: () =>
+              hostedRuntime.writeProjectFile(hostedViewer, {
+                projectId: body.projectId,
+                path: body.path,
+                contents: body.contents,
+              }),
+            catch: (cause) =>
+              new RouteRequestError({
+                message: `Failed to write hosted project file: ${String(cause)}`,
+              }),
+          });
+        }
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Workspace file writes by cwd are local-only in self-hosted mode.",
+          });
+        }
         const target = yield* resolveWorkspaceWritePath({
           workspaceRoot: body.cwd,
           relativePath: body.relativePath,
@@ -776,105 +1209,460 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         return { relativePath: target.relativePath };
       }
 
+      case WS_METHODS.projectsList:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted projects are only available in self-hosted mode.",
+          });
+        }
+        const listViewer = yield* getHostedViewer(viewer);
+        return yield* Effect.promise(() => hostedRuntime.listProjects(listViewer));
+
+      case WS_METHODS.projectsCreate:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted projects are only available in self-hosted mode.",
+          });
+        }
+        const createViewer = yield* getHostedViewer(viewer);
+        const createBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.projectsCreate));
+        return yield* Effect.promise(() => hostedRuntime.createProject(createViewer, createBody));
+
+      case WS_METHODS.projectsGet:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted projects are only available in self-hosted mode.",
+          });
+        }
+        const projectViewer = yield* getHostedViewer(viewer);
+        const projectBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.projectsGet));
+        return yield* Effect.promise(() => hostedRuntime.getProject(projectViewer, projectBody));
+
+      case WS_METHODS.projectsArchive:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted projects are only available in self-hosted mode.",
+          });
+        }
+        const archiveViewer = yield* getHostedViewer(viewer);
+        const archiveBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.projectsArchive));
+        return yield* Effect.promise(() =>
+          hostedRuntime.archiveProject(archiveViewer, archiveBody),
+        );
+
+      case WS_METHODS.projectsFilesList:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted project files are only available in self-hosted mode.",
+          });
+        }
+        const filesViewer = yield* getHostedViewer(viewer);
+        const filesBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.projectsFilesList));
+        return yield* Effect.promise(() => hostedRuntime.listProjectFiles(filesViewer, filesBody));
+
+      case WS_METHODS.projectsFilesRead:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted project files are only available in self-hosted mode.",
+          });
+        }
+        const readFileViewer = yield* getHostedViewer(viewer);
+        const readFileBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.projectsFilesRead),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.readProjectFile(readFileViewer, readFileBody),
+        );
+
+      case WS_METHODS.gitHostedStatus:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted git RPCs are only available in self-hosted mode.",
+          });
+        }
+        const hostedGitStatusViewer = yield* getHostedViewer(viewer);
+        const hostedGitStatusBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.gitHostedStatus),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.getGitStatus(hostedGitStatusViewer, hostedGitStatusBody),
+        );
+
+      case WS_METHODS.gitHostedBranches:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted git RPCs are only available in self-hosted mode.",
+          });
+        }
+        const hostedGitBranchesViewer = yield* getHostedViewer(viewer);
+        const hostedGitBranchesBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.gitHostedBranches),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.listGitBranches(hostedGitBranchesViewer, hostedGitBranchesBody),
+        );
+
+      case WS_METHODS.gitHostedCommits:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted git RPCs are only available in self-hosted mode.",
+          });
+        }
+        const hostedGitCommitsViewer = yield* getHostedViewer(viewer);
+        const hostedGitCommitsBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.gitHostedCommits),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.listGitCommits(hostedGitCommitsViewer, hostedGitCommitsBody),
+        );
+
+      case WS_METHODS.gitHostedDiff:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted git RPCs are only available in self-hosted mode.",
+          });
+        }
+        const hostedGitDiffViewer = yield* getHostedViewer(viewer);
+        const hostedGitDiffBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.gitHostedDiff),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.readGitDiff(hostedGitDiffViewer, hostedGitDiffBody),
+        );
+
+      case WS_METHODS.gitHostedCreateBranch:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted git RPCs are only available in self-hosted mode.",
+          });
+        }
+        const hostedGitCreateBranchViewer = yield* getHostedViewer(viewer);
+        const hostedGitCreateBranchBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.gitHostedCreateBranch),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.createGitBranch(hostedGitCreateBranchViewer, hostedGitCreateBranchBody),
+        );
+
+      case WS_METHODS.gitHostedSwitchBranch:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted git RPCs are only available in self-hosted mode.",
+          });
+        }
+        const hostedGitSwitchBranchViewer = yield* getHostedViewer(viewer);
+        const hostedGitSwitchBranchBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.gitHostedSwitchBranch),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.switchGitBranch(hostedGitSwitchBranchViewer, hostedGitSwitchBranchBody),
+        );
+
+      case WS_METHODS.terminalProjectOpen:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted project terminals are only available in self-hosted mode.",
+          });
+        }
+        const projectTerminalViewer = yield* getHostedViewer(viewer);
+        const projectTerminalBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.terminalProjectOpen),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.openProjectTerminal(projectTerminalViewer, projectTerminalBody),
+        );
+
+      case WS_METHODS.jobsList:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted jobs are only available in self-hosted mode.",
+          });
+        }
+        const jobsListViewer = yield* getHostedViewer(viewer);
+        const jobsListBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.jobsList));
+        return yield* Effect.promise(() => hostedRuntime.listJobs(jobsListViewer, jobsListBody));
+
+      case WS_METHODS.jobsGet:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted jobs are only available in self-hosted mode.",
+          });
+        }
+        const jobsGetViewer = yield* getHostedViewer(viewer);
+        const jobsGetBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.jobsGet));
+        return yield* Effect.promise(() => hostedRuntime.getJob(jobsGetViewer, jobsGetBody));
+
+      case WS_METHODS.jobsEvents:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted jobs are only available in self-hosted mode.",
+          });
+        }
+        const jobsEventsViewer = yield* getHostedViewer(viewer);
+        const jobsEventsBody = stripRequestTag(requestBodyForTag(request, WS_METHODS.jobsEvents));
+        return yield* Effect.promise(() =>
+          hostedRuntime.listJobEvents(jobsEventsViewer, jobsEventsBody),
+        );
+
+      case WS_METHODS.jobsRunCommand:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted jobs are only available in self-hosted mode.",
+          });
+        }
+        const jobsRunCommandViewer = yield* getHostedViewer(viewer);
+        const jobsRunCommandBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.jobsRunCommand),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.runCommand(jobsRunCommandViewer, jobsRunCommandBody),
+        );
+
+      case WS_METHODS.jobsAgentPrompt:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted jobs are only available in self-hosted mode.",
+          });
+        }
+        const jobsAgentPromptViewer = yield* getHostedViewer(viewer);
+        const jobsAgentPromptBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.jobsAgentPrompt),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.agentPrompt(jobsAgentPromptViewer, jobsAgentPromptBody),
+        );
+
+      case WS_METHODS.providersList:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted provider accounts are only available in self-hosted mode.",
+          });
+        }
+        const providersListViewer = yield* getHostedViewer(viewer);
+        return yield* Effect.promise(() => hostedRuntime.listProviderAccounts(providersListViewer));
+
+      case WS_METHODS.providersBeginLogin:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted provider accounts are only available in self-hosted mode.",
+          });
+        }
+        const providersLoginViewer = yield* getHostedViewer(viewer);
+        const providersLoginBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.providersBeginLogin),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.beginProviderLogin(providersLoginViewer, providersLoginBody),
+        );
+
+      case WS_METHODS.providersLogout:
+        if (deploymentMode !== "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Hosted provider accounts are only available in self-hosted mode.",
+          });
+        }
+        const providersLogoutViewer = yield* getHostedViewer(viewer);
+        const providersLogoutBody = stripRequestTag(
+          requestBodyForTag(request, WS_METHODS.providersLogout),
+        );
+        return yield* Effect.promise(() =>
+          hostedRuntime.logoutProvider(providersLogoutViewer, providersLogoutBody),
+        );
+
       case WS_METHODS.shellOpenInEditor: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Opening arbitrary cwd paths in an editor is local-only.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* openInEditor(body);
       }
 
       case WS_METHODS.gitStatus: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message:
+              "Local git status RPCs are disabled in self-hosted mode. Use git.hosted.* instead.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* gitManager.status(body);
       }
 
       case WS_METHODS.gitPull: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Local git pull RPCs are disabled in self-hosted mode.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* git.pullCurrentBranch(body.cwd);
       }
 
       case WS_METHODS.gitRunStackedAction: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Stacked git actions are local-only.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* gitManager.runStackedAction(body);
       }
 
       case WS_METHODS.gitResolvePullRequest: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Pull request helpers are local-only.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* gitManager.resolvePullRequest(body);
       }
 
       case WS_METHODS.gitPreparePullRequestThread: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Pull request thread preparation is local-only.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* gitManager.preparePullRequestThread(body);
       }
 
       case WS_METHODS.gitListBranches: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message:
+              "Local git branch RPCs are disabled in self-hosted mode. Use git.hosted.* instead.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* git.listBranches(body);
       }
 
       case WS_METHODS.gitCreateWorktree: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Git worktrees are local-only.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* git.createWorktree(body);
       }
 
       case WS_METHODS.gitRemoveWorktree: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Git worktree management is local-only.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* git.removeWorktree(body);
       }
 
       case WS_METHODS.gitCreateBranch: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message:
+              "Local git branch RPCs are disabled in self-hosted mode. Use git.hosted.* instead.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* git.createBranch(body);
       }
 
       case WS_METHODS.gitCheckout: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message:
+              "Local git checkout RPCs are disabled in self-hosted mode. Use git.hosted.* instead.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* Effect.scoped(git.checkoutBranch(body));
       }
 
       case WS_METHODS.gitInit: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Local git init RPCs are disabled in self-hosted mode.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* git.initRepo(body);
       }
 
       case WS_METHODS.terminalOpen: {
+        if (deploymentMode === "self-hosted") {
+          return yield* new RouteRequestError({
+            message: "Opening arbitrary terminals by cwd is local-only in self-hosted mode.",
+          });
+        }
         const body = stripRequestTag(request.body);
         return yield* terminalManager.open(body);
       }
 
       case WS_METHODS.terminalWrite: {
         const body = stripRequestTag(request.body);
+        if (deploymentMode === "self-hosted") {
+          yield* assertViewerOwnsTerminalThread(viewer, body.threadId);
+        }
         return yield* terminalManager.write(body);
       }
 
       case WS_METHODS.terminalResize: {
         const body = stripRequestTag(request.body);
+        if (deploymentMode === "self-hosted") {
+          yield* assertViewerOwnsTerminalThread(viewer, body.threadId);
+        }
         return yield* terminalManager.resize(body);
       }
 
       case WS_METHODS.terminalClear: {
         const body = stripRequestTag(request.body);
+        if (deploymentMode === "self-hosted") {
+          yield* assertViewerOwnsTerminalThread(viewer, body.threadId);
+        }
         return yield* terminalManager.clear(body);
       }
 
       case WS_METHODS.terminalRestart: {
         const body = stripRequestTag(request.body);
+        if (deploymentMode === "self-hosted") {
+          yield* assertViewerOwnsTerminalThread(viewer, body.threadId);
+        }
         return yield* terminalManager.restart(body);
       }
 
       case WS_METHODS.terminalClose: {
         const body = stripRequestTag(request.body);
+        if (deploymentMode === "self-hosted") {
+          yield* assertViewerOwnsTerminalThread(viewer, body.threadId);
+        }
         return yield* terminalManager.close(body);
       }
 
       case WS_METHODS.serverGetConfig:
         const keybindingsConfig = yield* keybindingsManager.loadConfigState;
+        const viewerProviderStatuses =
+          deploymentMode === "self-hosted" && viewer
+            ? serverProviderStatusesFromHostedAccounts(
+                (yield* Effect.promise(() =>
+                  hostedRuntime.listProviderAccounts(toHostedUser(viewer)),
+                )).accounts,
+              )
+            : providerStatuses;
         return {
+          deploymentMode,
           cwd,
           keybindingsConfigPath,
           keybindings: keybindingsConfig.keybindings,
           issues: keybindingsConfig.issues,
-          providers: providerStatuses,
+          providers: viewerProviderStatuses,
           availableEditors,
+          viewer,
+          localCapabilities,
         };
 
       case WS_METHODS.serverUpsertKeybinding: {
@@ -915,7 +1703,9 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
       });
     }
 
-    const result = yield* Effect.exit(routeRequest(request.success));
+    const result = yield* Effect.exit(
+      routeRequest(request.success, clientViewerMap.get(ws) ?? null),
+    );
     if (Exit.isFailure(result)) {
       return yield* sendWsResponse({
         id: request.success.id,
@@ -932,28 +1722,54 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   httpServer.on("upgrade", (request, socket, head) => {
     socket.on("error", () => {}); // Prevent unhandled `EPIPE`/`ECONNRESET` from crashing the process if the client disconnects mid-handshake
 
-    if (authToken) {
-      let providedToken: string | null = null;
-      try {
-        const url = new URL(request.url ?? "/", `http://localhost:${port}`);
-        providedToken = url.searchParams.get("token");
-      } catch {
-        rejectUpgrade(socket, 400, "Invalid WebSocket URL");
+    const rejectUpgrade = (statusCode: number, message: string) => {
+      if (!socket.writable) {
+        socket.destroy();
         return;
       }
+      socket.write(
+        `HTTP/1.1 ${statusCode} ${statusCode === 401 ? "Unauthorized" : "Forbidden"}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n${message}`,
+      );
+      socket.destroy();
+    };
 
-      if (providedToken !== authToken) {
-        rejectUpgrade(socket, 401, "Unauthorized WebSocket connection");
-        return;
-      }
+    const acceptUpgrade = (viewer: ServerViewer | null) => {
+      requestViewerMap.set(request, viewer);
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, request);
+      });
+    };
+
+    if (deploymentMode !== "self-hosted") {
+      acceptUpgrade(null);
+      return;
     }
 
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
-    });
+    const requestUrl = new URL(
+      request.url ?? "/",
+      serverConfig.publicBaseUrl?.toString() ?? `http://${request.headers.host ?? "127.0.0.1"}`,
+    );
+    if (requestUrl.searchParams.has("token")) {
+      rejectUpgrade(400, "Legacy token query authentication is disabled in self-hosted mode.");
+      return;
+    }
+
+    void resolveViewerFromRequest(request, serverConfig)
+      .then((viewer) => {
+        acceptUpgrade(viewer);
+      })
+      .catch((error) => {
+        const authError =
+          error instanceof SelfHostedAuthError
+            ? error
+            : new SelfHostedAuthError(401, "Authentication required.");
+        rejectUpgrade(authError.statusCode, authError.message);
+      });
   });
 
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, request) => {
+    const viewer = requestViewerMap.get(request) ?? null;
+    clientViewerMap.set(ws, viewer);
     const segments = cwd.split(/[/\\]/).filter(Boolean);
     const projectName = segments[segments.length - 1] ?? "project";
 
@@ -979,6 +1795,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     });
 
     ws.on("close", () => {
+      clientViewerMap.delete(ws);
       void runPromise(
         Ref.update(clients, (clients) => {
           clients.delete(ws);
@@ -988,6 +1805,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     });
 
     ws.on("error", () => {
+      clientViewerMap.delete(ws);
       void runPromise(
         Ref.update(clients, (clients) => {
           clients.delete(ws);

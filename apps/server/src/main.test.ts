@@ -1,17 +1,19 @@
 import * as Http from "node:http";
+import path from "node:path";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, vi } from "@effect/vitest";
 import type { OrchestrationReadModel } from "@t3tools/contracts";
+import { NetService } from "@t3tools/shared/Net";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
+import { FetchHttpClient } from "effect/unstable/http";
 import * as Layer from "effect/Layer";
 import * as Command from "effect/unstable/cli/Command";
-import { FetchHttpClient } from "effect/unstable/http";
 import { beforeEach } from "vitest";
-import { NetService } from "@t3tools/shared/Net";
 
-import { CliConfig, recordStartupHeartbeat, t3Cli, type CliConfigShape } from "./main";
 import { ServerConfig, type ServerConfigShape } from "./config";
+import { CliConfig, recordStartupHeartbeat, t3Cli, type CliConfigShape } from "./main";
 import { Open, type OpenShape } from "./open";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
@@ -30,7 +32,6 @@ const serverStart = Effect.acquireRelease(
 );
 const findAvailablePort = vi.fn((preferred: number) => Effect.succeed(preferred));
 
-// Shared service layer used by this CLI test suite.
 const testLayer = Layer.mergeAll(
   Layer.succeed(CliConfig, {
     cwd: "/tmp/t3-test-workspace",
@@ -56,17 +57,15 @@ const testLayer = Layer.mergeAll(
   NodeServices.layer,
 );
 
-const runCli = (
-  args: ReadonlyArray<string>,
-  env: Record<string, string> = { T3CODE_NO_BROWSER: "true" },
-) => {
-  const uniqueStateDir = `/tmp/t3-cli-state-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+const runCli = (args: ReadonlyArray<string>, env: Record<string, string> = {}) => {
+  const uniqueDataRoot = `/tmp/t3-cli-data-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   return Command.runWith(t3Cli, { version: "0.0.0-test" })(args).pipe(
     Effect.provide(
       ConfigProvider.layer(
         ConfigProvider.fromEnv({
           env: {
-            T3CODE_STATE_DIR: uniqueStateDir,
+            DATA_ROOT: uniqueDataRoot,
+            T3CODE_NO_BROWSER: "true",
             ...env,
           },
         }),
@@ -74,6 +73,10 @@ const runCli = (
     ),
   );
 };
+
+function resolveExpectedDataRoot(value: string): string {
+  return path.resolve(value);
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -84,86 +87,69 @@ beforeEach(() => {
 });
 
 it.layer(testLayer)("server CLI command", (it) => {
-  it.effect("parses all CLI flags and wires scoped start/stop", () =>
+  it.effect("parses CLI flags and wires scoped start/stop", () =>
     Effect.gen(function* () {
+      const expectedDataRoot = resolveExpectedDataRoot("/tmp/t3-cli-state");
       yield* runCli([
-        "--mode",
-        "desktop",
         "--port",
         "4010",
         "--host",
         "0.0.0.0",
-        "--state-dir",
+        "--data-root",
         "/tmp/t3-cli-state",
         "--dev-url",
         "http://127.0.0.1:5173",
         "--no-browser",
-        "--auth-token",
-        "auth-secret",
       ]);
 
       assert.equal(start.mock.calls.length, 1);
-      assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4010);
       assert.equal(resolvedConfig?.host, "0.0.0.0");
-      assert.equal(resolvedConfig?.stateDir, "/tmp/t3-cli-state");
+      assert.equal(resolvedConfig?.dataRoot, expectedDataRoot);
+      assert.equal(resolvedConfig?.stateDir, expectedDataRoot);
+      assert.equal(resolvedConfig?.databasePath, path.join(expectedDataRoot, "db", "state.sqlite"));
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://127.0.0.1:5173/");
       assert.equal(resolvedConfig?.noBrowser, true);
-      assert.equal(resolvedConfig?.authToken, "auth-secret");
-      assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, false);
+      assert.equal(resolvedConfig?.clerkSecretKey, undefined);
+      assert.deepEqual(resolvedConfig?.clerkAllowedUserIds, []);
+      assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, true);
       assert.equal(resolvedConfig?.logWebSocketEvents, true);
       assert.equal(stop.mock.calls.length, 1);
     }),
   );
 
-  it.effect("supports --token as an alias for --auth-token", () =>
+  it.effect("uses env fallbacks for data root and Clerk config", () =>
     Effect.gen(function* () {
-      yield* runCli(["--token", "token-secret"]);
-
-      assert.equal(start.mock.calls.length, 1);
-      assert.equal(resolvedConfig?.authToken, "token-secret");
-    }),
-  );
-
-  it.effect("uses env fallbacks when flags are not provided", () =>
-    Effect.gen(function* () {
+      const expectedDataRoot = resolveExpectedDataRoot("/tmp/t3-env-state");
       yield* runCli([], {
-        T3CODE_MODE: "desktop",
         T3CODE_PORT: "4999",
         T3CODE_HOST: "100.88.10.4",
-        T3CODE_STATE_DIR: "/tmp/t3-env-state",
+        DATA_ROOT: "/tmp/t3-env-state",
         VITE_DEV_SERVER_URL: "http://localhost:5173",
         T3CODE_NO_BROWSER: "true",
-        T3CODE_AUTH_TOKEN: "env-token",
+        CLERK_SECRET_KEY: "sk_test_server",
+        CLERK_ALLOWED_USER_IDS: "user-1, user-2",
+        CLERK_ALLOWED_EMAILS: "a@example.com, b@example.com",
+        CLERK_ALLOWED_EMAIL_DOMAINS: "example.com, example.org",
+        T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: "false",
+        T3CODE_LOG_WS_EVENTS: "false",
       });
 
       assert.equal(start.mock.calls.length, 1);
-      assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4999);
       assert.equal(resolvedConfig?.host, "100.88.10.4");
-      assert.equal(resolvedConfig?.stateDir, "/tmp/t3-env-state");
+      assert.equal(resolvedConfig?.dataRoot, expectedDataRoot);
+      assert.equal(resolvedConfig?.stateDir, expectedDataRoot);
+      assert.equal(resolvedConfig?.databasePath, path.join(expectedDataRoot, "db", "state.sqlite"));
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://localhost:5173/");
       assert.equal(resolvedConfig?.noBrowser, true);
-      assert.equal(resolvedConfig?.authToken, "env-token");
+      assert.equal(resolvedConfig?.clerkSecretKey, "sk_test_server");
+      assert.deepEqual(resolvedConfig?.clerkAllowedUserIds, ["user-1", "user-2"]);
+      assert.deepEqual(resolvedConfig?.clerkAllowedEmails, ["a@example.com", "b@example.com"]);
+      assert.deepEqual(resolvedConfig?.clerkAllowedEmailDomains, ["example.com", "example.org"]);
       assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, false);
-      assert.equal(resolvedConfig?.logWebSocketEvents, true);
+      assert.equal(resolvedConfig?.logWebSocketEvents, false);
       assert.equal(findAvailablePort.mock.calls.length, 0);
-    }),
-  );
-
-  it.effect("prefers --mode over T3CODE_MODE", () =>
-    Effect.gen(function* () {
-      findAvailablePort.mockImplementation((_preferred: number) => Effect.succeed(4666));
-      yield* runCli(["--mode", "web"], {
-        T3CODE_MODE: "desktop",
-        T3CODE_NO_BROWSER: "true",
-      });
-
-      assert.deepStrictEqual(findAvailablePort.mock.calls, [[3773]]);
-      assert.equal(start.mock.calls.length, 1);
-      assert.equal(resolvedConfig?.mode, "web");
-      assert.equal(resolvedConfig?.port, 4666);
-      assert.equal(resolvedConfig?.host, undefined);
     }),
   );
 
@@ -178,7 +164,7 @@ it.layer(testLayer)("server CLI command", (it) => {
     }),
   );
 
-  it.effect("uses dynamic port discovery in web mode when port is omitted", () =>
+  it.effect("uses dynamic port discovery when port is omitted", () =>
     Effect.gen(function* () {
       findAvailablePort.mockImplementation((_preferred: number) => Effect.succeed(5444));
       yield* runCli([]);
@@ -186,50 +172,20 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.deepStrictEqual(findAvailablePort.mock.calls, [[3773]]);
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.port, 5444);
-      assert.equal(resolvedConfig?.mode, "web");
-    }),
-  );
-
-  it.effect("uses fixed localhost defaults in desktop mode", () =>
-    Effect.gen(function* () {
-      yield* runCli([], {
-        T3CODE_MODE: "desktop",
-        T3CODE_NO_BROWSER: "true",
-      });
-
-      assert.equal(findAvailablePort.mock.calls.length, 0);
-      assert.equal(start.mock.calls.length, 1);
-      assert.equal(resolvedConfig?.port, 3773);
-      assert.equal(resolvedConfig?.host, "127.0.0.1");
-      assert.equal(resolvedConfig?.mode, "desktop");
-    }),
-  );
-
-  it.effect("allows overriding desktop host with --host", () =>
-    Effect.gen(function* () {
-      yield* runCli(["--host", "0.0.0.0"], {
-        T3CODE_MODE: "desktop",
-        T3CODE_NO_BROWSER: "true",
-      });
-
-      assert.equal(start.mock.calls.length, 1);
-      assert.equal(resolvedConfig?.mode, "desktop");
-      assert.equal(resolvedConfig?.host, "0.0.0.0");
+      assert.equal(resolvedConfig?.host, undefined);
     }),
   );
 
   it.effect("supports CLI and env for bootstrap/log websocket toggles", () =>
     Effect.gen(function* () {
-      yield* runCli(["--auto-bootstrap-project-from-cwd"], {
-        T3CODE_MODE: "desktop",
+      yield* runCli(["--auto-bootstrap-project-from-cwd", "--log-websocket-events"], {
         T3CODE_LOG_WS_EVENTS: "false",
         T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: "false",
-        T3CODE_NO_BROWSER: "true",
       });
 
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.autoBootstrapProjectFromCwd, true);
-      assert.equal(resolvedConfig?.logWebSocketEvents, false);
+      assert.equal(resolvedConfig?.logWebSocketEvents, true);
     }),
   );
 
@@ -270,15 +226,6 @@ it.layer(testLayer)("server CLI command", (it) => {
     }),
   );
 
-  it.effect("does not start server for invalid --mode values", () =>
-    Effect.gen(function* () {
-      yield* runCli(["--mode", "invalid"]);
-
-      assert.equal(start.mock.calls.length, 0);
-      assert.equal(stop.mock.calls.length, 0);
-    }),
-  );
-
   it.effect("does not start server for invalid --dev-url values", () =>
     Effect.gen(function* () {
       yield* runCli(["--dev-url", "not-a-url"]).pipe(Effect.catch(() => Effect.void));
@@ -292,7 +239,6 @@ it.layer(testLayer)("server CLI command", (it) => {
     Effect.gen(function* () {
       yield* runCli(["--port", "70000"]);
 
-      // effect/unstable/cli renders help/errors for parse failures and returns success.
       assert.equal(start.mock.calls.length, 0);
       assert.equal(stop.mock.calls.length, 0);
     }),

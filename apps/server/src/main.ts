@@ -9,13 +9,7 @@
 import { Config, Data, Effect, FileSystem, Layer, Option, Path, Schema, ServiceMap } from "effect";
 import { Command, Flag } from "effect/unstable/cli";
 import { NetService } from "@t3tools/shared/Net";
-import {
-  DEFAULT_PORT,
-  resolveStaticDir,
-  ServerConfig,
-  type RuntimeMode,
-  type ServerConfigShape,
-} from "./config";
+import { DEFAULT_PORT, resolveStaticDir, ServerConfig, type ServerConfigShape } from "./config";
 import { fixPath, resolveStateDir } from "./os-jank";
 import { Open } from "./open";
 import * as SqlitePersistence from "./persistence/Layers/Sqlite";
@@ -33,13 +27,13 @@ export class StartupError extends Data.TaggedError("StartupError")<{
 }> {}
 
 interface CliInput {
-  readonly mode: Option.Option<RuntimeMode>;
   readonly port: Option.Option<number>;
   readonly host: Option.Option<string>;
-  readonly stateDir: Option.Option<string>;
+  readonly dataRoot: Option.Option<string>;
+  readonly deploymentMode: Option.Option<string>;
+  readonly publicBaseUrl: Option.Option<URL>;
   readonly devUrl: Option.Option<URL>;
   readonly noBrowser: Option.Option<boolean>;
-  readonly authToken: Option.Option<string>;
   readonly autoBootstrapProjectFromCwd: Option.Option<boolean>;
   readonly logWebSocketEvents: Option.Option<boolean>;
 }
@@ -88,27 +82,39 @@ export class CliConfig extends ServiceMap.Service<CliConfig, CliConfigShape>()(
 }
 
 const CliEnvConfig = Config.all({
-  mode: Config.string("T3CODE_MODE").pipe(
-    Config.option,
-    Config.map(
-      Option.match<RuntimeMode, string>({
-        onNone: () => "web",
-        onSome: (value) => (value === "desktop" ? "desktop" : "web"),
-      }),
-    ),
-  ),
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
-  stateDir: Config.string("T3CODE_STATE_DIR").pipe(
-    Config.option,
-    Config.map(Option.getOrUndefined),
-  ),
+  dataRoot: Config.string("DATA_ROOT").pipe(Config.option, Config.map(Option.getOrUndefined)),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   noBrowser: Config.boolean("T3CODE_NO_BROWSER").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
-  authToken: Config.string("T3CODE_AUTH_TOKEN").pipe(
+  deploymentMode: Config.string("T3_DEPLOYMENT_MODE").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  publicBaseUrl: Config.url("T3_PUBLIC_BASE_URL").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  clerkSecretKey: Config.string("CLERK_SECRET_KEY").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  clerkPublishableKey: Config.string("CLERK_PUBLISHABLE_KEY").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  clerkAllowedUserIds: Config.string("CLERK_ALLOWED_USER_IDS").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  clerkAllowedEmails: Config.string("CLERK_ALLOWED_EMAILS").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  clerkAllowedEmailDomains: Config.string("CLERK_ALLOWED_EMAIL_DOMAINS").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
@@ -125,6 +131,12 @@ const CliEnvConfig = Config.all({
 const resolveBooleanFlag = (flag: Option.Option<boolean>, envValue: boolean) =>
   Option.getOrElse(Option.filter(flag, Boolean), () => envValue);
 
+const parseList = (value: string | undefined): ReadonlyArray<string> =>
+  (value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
 const ServerConfigLive = (input: CliInput) =>
   Layer.effect(
     ServerConfig,
@@ -138,53 +150,87 @@ const ServerConfigLive = (input: CliInput) =>
         ),
       );
 
-      const mode = Option.getOrElse(input.mode, () => env.mode);
-
       const port = yield* Option.match(input.port, {
         onSome: (value) => Effect.succeed(value),
         onNone: () => {
           if (env.port) {
             return Effect.succeed(env.port);
           }
-          if (mode === "desktop") {
-            return Effect.succeed(DEFAULT_PORT);
-          }
           return findAvailablePort(DEFAULT_PORT);
         },
       });
-      const stateDir = yield* resolveStateDir(
-        Option.getOrUndefined(input.stateDir) ?? env.stateDir,
+      const dataRoot = yield* resolveStateDir(
+        Option.getOrUndefined(input.dataRoot) ?? env.dataRoot ?? "/data",
       );
+      const deploymentMode =
+        Option.getOrUndefined(input.deploymentMode) ?? env.deploymentMode ?? "local";
+      if (deploymentMode !== "local" && deploymentMode !== "self-hosted") {
+        return yield* new StartupError({
+          message: `Unsupported deployment mode '${deploymentMode}'. Expected 'local' or 'self-hosted'.`,
+        });
+      }
       const devUrl = Option.getOrElse(input.devUrl, () => env.devUrl);
-      const noBrowser = resolveBooleanFlag(input.noBrowser, env.noBrowser ?? mode === "desktop");
-      const authToken = Option.getOrUndefined(input.authToken) ?? env.authToken;
-      const autoBootstrapProjectFromCwd = resolveBooleanFlag(
-        input.autoBootstrapProjectFromCwd,
-        env.autoBootstrapProjectFromCwd ?? mode === "web",
-      );
+      const publicBaseUrl = Option.getOrElse(input.publicBaseUrl, () => env.publicBaseUrl);
+      const noBrowser = resolveBooleanFlag(input.noBrowser, env.noBrowser ?? false);
+      const autoBootstrapProjectFromCwd =
+        deploymentMode === "self-hosted"
+          ? false
+          : resolveBooleanFlag(
+              input.autoBootstrapProjectFromCwd,
+              env.autoBootstrapProjectFromCwd ?? true,
+            );
       const logWebSocketEvents = resolveBooleanFlag(
         input.logWebSocketEvents,
         env.logWebSocketEvents ?? Boolean(devUrl),
       );
+      if (deploymentMode === "self-hosted") {
+        if (!env.clerkSecretKey) {
+          return yield* new StartupError({
+            message: "Self-hosted mode requires CLERK_SECRET_KEY.",
+          });
+        }
+        if (!env.clerkPublishableKey) {
+          return yield* new StartupError({
+            message: "Self-hosted mode requires CLERK_PUBLISHABLE_KEY.",
+          });
+        }
+        if (!publicBaseUrl) {
+          return yield* new StartupError({
+            message: "Self-hosted mode requires T3_PUBLIC_BASE_URL.",
+          });
+        }
+        if (devUrl && devUrl.origin !== publicBaseUrl.origin) {
+          return yield* new StartupError({
+            message:
+              "Self-hosted mode requires same-origin browser/server URLs. VITE_DEV_SERVER_URL must match T3_PUBLIC_BASE_URL.",
+          });
+        }
+      }
       const staticDir = devUrl ? undefined : yield* cliConfig.resolveStaticDir;
       const { join } = yield* Path.Path;
-      const keybindingsConfigPath = join(stateDir, "keybindings.json");
-      const host =
-        Option.getOrUndefined(input.host) ??
-        env.host ??
-        (mode === "desktop" ? "127.0.0.1" : undefined);
+      const stateDir = dataRoot;
+      const databasePath = join(dataRoot, "db", "state.sqlite");
+      const keybindingsConfigPath = join(dataRoot, "keybindings.json");
+      const host = Option.getOrUndefined(input.host) ?? env.host;
 
       const config: ServerConfigShape = {
-        mode,
+        deploymentMode,
         port,
         cwd: cliConfig.cwd,
+        dataRoot,
+        databasePath,
         keybindingsConfigPath,
         host,
         stateDir,
         staticDir,
         devUrl,
         noBrowser,
-        authToken,
+        clerkSecretKey: env.clerkSecretKey,
+        clerkPublishableKey: env.clerkPublishableKey,
+        publicBaseUrl,
+        clerkAllowedUserIds: parseList(env.clerkAllowedUserIds),
+        clerkAllowedEmails: parseList(env.clerkAllowedEmails),
+        clerkAllowedEmailDomains: parseList(env.clerkAllowedEmailDomains),
         autoBootstrapProjectFromCwd,
         logWebSocketEvents,
       } satisfies ServerConfigShape;
@@ -261,11 +307,11 @@ const makeServerProgram = (input: CliInput) =>
       config.host && !isWildcardHost(config.host)
         ? `http://${formatHostForUrl(config.host)}:${config.port}`
         : localUrl;
-    const { authToken, devUrl, ...safeConfig } = config;
+    const { clerkSecretKey, devUrl, ...safeConfig } = config;
     yield* Effect.logInfo("T3 Code running", {
       ...safeConfig,
       devUrl: devUrl?.toString(),
-      authEnabled: Boolean(authToken),
+      authEnabled: Boolean(clerkSecretKey),
     });
 
     if (!config.noBrowser) {
@@ -286,10 +332,6 @@ const makeServerProgram = (input: CliInput) =>
  * These flags mirrors the environment variables and the config shape.
  */
 
-const modeFlag = Flag.choice("mode", ["web", "desktop"]).pipe(
-  Flag.withDescription("Runtime mode. `desktop` keeps loopback defaults unless overridden."),
-  Flag.optional,
-);
 const portFlag = Flag.integer("port").pipe(
   Flag.withSchema(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65535 }))),
   Flag.withDescription("Port for the HTTP/WebSocket server."),
@@ -299,8 +341,17 @@ const hostFlag = Flag.string("host").pipe(
   Flag.withDescription("Host/interface to bind (for example 127.0.0.1, 0.0.0.0, or a Tailnet IP)."),
   Flag.optional,
 );
-const stateDirFlag = Flag.string("state-dir").pipe(
-  Flag.withDescription("State directory path (equivalent to T3CODE_STATE_DIR)."),
+const dataRootFlag = Flag.string("data-root").pipe(
+  Flag.withDescription("Persistent data root path (equivalent to DATA_ROOT)."),
+  Flag.optional,
+);
+const deploymentModeFlag = Flag.string("deployment-mode").pipe(
+  Flag.withDescription("Deployment mode: local or self-hosted."),
+  Flag.optional,
+);
+const publicBaseUrlFlag = Flag.string("public-base-url").pipe(
+  Flag.withSchema(Schema.URLFromString),
+  Flag.withDescription("Public same-origin base URL for self-hosted mode."),
   Flag.optional,
 );
 const devUrlFlag = Flag.string("dev-url").pipe(
@@ -310,11 +361,6 @@ const devUrlFlag = Flag.string("dev-url").pipe(
 );
 const noBrowserFlag = Flag.boolean("no-browser").pipe(
   Flag.withDescription("Disable automatic browser opening."),
-  Flag.optional,
-);
-const authTokenFlag = Flag.string("auth-token").pipe(
-  Flag.withDescription("Auth token required for WebSocket connections."),
-  Flag.withAlias("token"),
   Flag.optional,
 );
 const autoBootstrapProjectFromCwdFlag = Flag.boolean("auto-bootstrap-project-from-cwd").pipe(
@@ -332,13 +378,13 @@ const logWebSocketEventsFlag = Flag.boolean("log-websocket-events").pipe(
 );
 
 export const t3Cli = Command.make("t3", {
-  mode: modeFlag,
   port: portFlag,
   host: hostFlag,
-  stateDir: stateDirFlag,
+  dataRoot: dataRootFlag,
+  deploymentMode: deploymentModeFlag,
+  publicBaseUrl: publicBaseUrlFlag,
   devUrl: devUrlFlag,
   noBrowser: noBrowserFlag,
-  authToken: authTokenFlag,
   autoBootstrapProjectFromCwd: autoBootstrapProjectFromCwdFlag,
   logWebSocketEvents: logWebSocketEventsFlag,
 }).pipe(

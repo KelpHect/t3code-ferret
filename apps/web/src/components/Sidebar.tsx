@@ -84,6 +84,7 @@ import { useThreadSelectionStore } from "../threadSelectionStore";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
 import { isNonEmpty as isNonEmptyString } from "effect/String";
 import { resolveThreadStatusPill, shouldClearThreadSelectionOnMouseDown } from "./Sidebar.logic";
+import { getRuntimePublicConfig, useRuntimePublicConfig } from "../runtimeConfig";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 const THREAD_PREVIEW_LIMIT = 6;
@@ -184,6 +185,10 @@ function T3Wordmark() {
  * sources WsTransport uses, converting ws(s) to http(s).
  */
 function getServerHttpOrigin(): string {
+  const runtimeConfig = getRuntimePublicConfig();
+  if (runtimeConfig.deploymentMode === "self-hosted") {
+    return window.location.origin;
+  }
   const bridgeUrl = window.desktopBridge?.getWsUrl();
   const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
   const wsUrl =
@@ -276,6 +281,8 @@ export default function Sidebar() {
   const navigate = useNavigate();
   const isOnSettings = useLocation({ select: (loc) => loc.pathname === "/settings" });
   const { settings: appSettings } = useAppSettings();
+  const runtimeConfig = useRuntimePublicConfig();
+  const isSelfHosted = runtimeConfig.deploymentMode === "self-hosted";
   const routeThreadId = useParams({
     strict: false,
     select: (params) => (params.threadId ? ThreadId.makeUnsafe(params.threadId) : null),
@@ -288,6 +295,12 @@ export default function Sidebar() {
   const removeWorktreeMutation = useMutation(gitRemoveWorktreeMutationOptions({ queryClient }));
   const [addingProject, setAddingProject] = useState(false);
   const [newCwd, setNewCwd] = useState("");
+  const [newHostedProjectName, setNewHostedProjectName] = useState("");
+  const [newHostedProjectRemoteUrl, setNewHostedProjectRemoteUrl] = useState("");
+  const [newHostedProjectDefaultBranch, setNewHostedProjectDefaultBranch] = useState("");
+  const [newHostedProjectDefaultModel, setNewHostedProjectDefaultModel] = useState<string>(
+    DEFAULT_MODEL_BY_PROVIDER.codex,
+  );
   const [isPickingFolder, setIsPickingFolder] = useState(false);
   const [isAddingProject, setIsAddingProject] = useState(false);
   const [addProjectError, setAddProjectError] = useState<string | null>(null);
@@ -308,7 +321,7 @@ export default function Sidebar() {
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
   const removeFromSelection = useThreadSelectionStore((s) => s.removeFromSelection);
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
-  const shouldBrowseForProjectImmediately = isElectron;
+  const shouldBrowseForProjectImmediately = isElectron && !isSelfHosted;
   const shouldShowProjectPathEntry = addingProject && !shouldBrowseForProjectImmediately;
   const pendingApprovalByThreadId = useMemo(() => {
     const map = new Map<ThreadId, boolean>();
@@ -558,6 +571,49 @@ export default function Sidebar() {
   };
 
   const canAddProject = newCwd.trim().length > 0 && !isAddingProject;
+
+  const addHostedProject = useCallback(async () => {
+    const name = newHostedProjectName.trim();
+    if (!name || isAddingProject) return;
+    const api = readNativeApi();
+    if (!api) return;
+
+    setIsAddingProject(true);
+    try {
+      const result = await api.projects.create({
+        name,
+        ...(newHostedProjectRemoteUrl.trim().length > 0
+          ? { gitRemoteUrl: newHostedProjectRemoteUrl.trim() }
+          : {}),
+        ...(newHostedProjectDefaultBranch.trim().length > 0
+          ? { defaultBranch: newHostedProjectDefaultBranch.trim() }
+          : {}),
+        ...(newHostedProjectDefaultModel.trim().length > 0
+          ? { defaultModel: newHostedProjectDefaultModel.trim() }
+          : {}),
+      });
+      await handleNewThread(result.project.id).catch(() => undefined);
+      setAddingProject(false);
+      setAddProjectError(null);
+      setNewHostedProjectName("");
+      setNewHostedProjectRemoteUrl("");
+      setNewHostedProjectDefaultBranch("");
+      setNewHostedProjectDefaultModel(DEFAULT_MODEL_BY_PROVIDER.codex);
+    } catch (error) {
+      setAddProjectError(error instanceof Error ? error.message : "Failed to create project.");
+    } finally {
+      setIsAddingProject(false);
+    }
+  }, [
+    handleNewThread,
+    isAddingProject,
+    newHostedProjectDefaultBranch,
+    newHostedProjectDefaultModel,
+    newHostedProjectName,
+    newHostedProjectRemoteUrl,
+  ]);
+
+  const canAddHostedProject = newHostedProjectName.trim().length > 0 && !isAddingProject;
 
   const handlePickFolder = async () => {
     const api = readNativeApi();
@@ -1326,7 +1382,7 @@ export default function Sidebar() {
                 render={
                   <button
                     type="button"
-                    aria-label="Add project"
+                    aria-label={isSelfHosted ? "Create project" : "Add project"}
                     aria-pressed={shouldShowProjectPathEntry}
                     className="inline-flex size-5 items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-accent hover:text-foreground"
                     onClick={handleStartAddProject}
@@ -1339,13 +1395,15 @@ export default function Sidebar() {
                   }`}
                 />
               </TooltipTrigger>
-              <TooltipPopup side="right">Add project</TooltipPopup>
+              <TooltipPopup side="right">
+                {isSelfHosted ? "Create project" : "Add project"}
+              </TooltipPopup>
             </Tooltip>
           </div>
 
           {shouldShowProjectPathEntry && (
             <div className="mb-2 px-1">
-              {isElectron && (
+              {!isSelfHosted && isElectron && (
                 <button
                   type="button"
                   className="mb-1.5 flex w-full items-center justify-center gap-2 rounded-md border border-border bg-secondary py-1.5 text-xs text-foreground/80 transition-colors duration-150 hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
@@ -1356,38 +1414,90 @@ export default function Sidebar() {
                   {isPickingFolder ? "Picking folder..." : "Browse for folder"}
                 </button>
               )}
-              <div className="flex gap-1.5">
-                <input
-                  ref={addProjectInputRef}
-                  className={`min-w-0 flex-1 rounded-md border bg-secondary px-2 py-1 font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-none ${
-                    addProjectError
-                      ? "border-red-500/70 focus:border-red-500"
-                      : "border-border focus:border-ring"
-                  }`}
-                  placeholder="/path/to/project"
-                  value={newCwd}
-                  onChange={(event) => {
-                    setNewCwd(event.target.value);
-                    setAddProjectError(null);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") handleAddProject();
-                    if (event.key === "Escape") {
-                      setAddingProject(false);
+              {isSelfHosted ? (
+                <div className="space-y-1.5">
+                  <input
+                    className={`w-full rounded-md border bg-secondary px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-none ${
+                      addProjectError
+                        ? "border-red-500/70 focus:border-red-500"
+                        : "border-border focus:border-ring"
+                    }`}
+                    placeholder="Project name"
+                    value={newHostedProjectName}
+                    onChange={(event) => {
+                      setNewHostedProjectName(event.target.value);
                       setAddProjectError(null);
-                    }
-                  }}
-                  autoFocus
-                />
-                <button
-                  type="button"
-                  className="shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors duration-150 hover:bg-primary/90 disabled:opacity-60"
-                  onClick={handleAddProject}
-                  disabled={!canAddProject}
-                >
-                  {isAddingProject ? "Adding..." : "Add"}
-                </button>
-              </div>
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && canAddHostedProject) {
+                        void addHostedProject();
+                      }
+                    }}
+                    autoFocus
+                  />
+                  <input
+                    className="w-full rounded-md border border-border bg-secondary px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
+                    placeholder="Remote URL (optional)"
+                    value={newHostedProjectRemoteUrl}
+                    onChange={(event) => setNewHostedProjectRemoteUrl(event.target.value)}
+                  />
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <input
+                      className="w-full rounded-md border border-border bg-secondary px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
+                      placeholder="Default branch"
+                      value={newHostedProjectDefaultBranch}
+                      onChange={(event) => setNewHostedProjectDefaultBranch(event.target.value)}
+                    />
+                    <input
+                      className="w-full rounded-md border border-border bg-secondary px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
+                      placeholder="Model"
+                      value={newHostedProjectDefaultModel}
+                      onChange={(event) => setNewHostedProjectDefaultModel(event.target.value)}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className="w-full rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors duration-150 hover:bg-primary/90 disabled:opacity-60"
+                    onClick={() => void addHostedProject()}
+                    disabled={!canAddHostedProject}
+                  >
+                    {isAddingProject ? "Creating..." : "Create project"}
+                  </button>
+                </div>
+              ) : (
+                <div className="flex gap-1.5">
+                  <input
+                    ref={addProjectInputRef}
+                    className={`min-w-0 flex-1 rounded-md border bg-secondary px-2 py-1 font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-none ${
+                      addProjectError
+                        ? "border-red-500/70 focus:border-red-500"
+                        : "border-border focus:border-ring"
+                    }`}
+                    placeholder="/path/to/project"
+                    value={newCwd}
+                    onChange={(event) => {
+                      setNewCwd(event.target.value);
+                      setAddProjectError(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") handleAddProject();
+                      if (event.key === "Escape") {
+                        setAddingProject(false);
+                        setAddProjectError(null);
+                      }
+                    }}
+                    autoFocus
+                  />
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors duration-150 hover:bg-primary/90 disabled:opacity-60"
+                    onClick={handleAddProject}
+                    disabled={!canAddProject}
+                  >
+                    {isAddingProject ? "Adding..." : "Add"}
+                  </button>
+                </div>
+              )}
               {addProjectError && (
                 <p className="mt-1 px-0.5 text-[11px] leading-tight text-red-400">
                   {addProjectError}

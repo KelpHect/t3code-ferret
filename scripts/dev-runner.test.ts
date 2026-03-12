@@ -4,7 +4,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { Effect } from "effect";
 
 import {
-  DEFAULT_DEV_STATE_DIR,
+  DEFAULT_DEV_DATA_ROOT,
   createDevRunnerEnv,
   findFirstAvailableOffset,
   resolveModePortOffsets,
@@ -46,16 +46,14 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
   });
 
   describe("createDevRunnerEnv", () => {
-    it.effect("defaults state dir to ~/.t3/dev when not provided", () =>
+    it.effect("defaults data root to ~/.t3/dev when not provided", () =>
       Effect.gen(function* () {
-        const [env, defaultStateDir] = yield* Effect.all([
+        const [env, defaultDataRoot] = yield* Effect.all([
           createDevRunnerEnv({
-            mode: "dev",
             baseEnv: {},
             serverOffset: 0,
             webOffset: 0,
-            stateDir: undefined,
-            authToken: undefined,
+            dataRoot: undefined,
             noBrowser: undefined,
             autoBootstrapProjectFromCwd: undefined,
             logWebSocketEvents: undefined,
@@ -63,22 +61,20 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
             port: undefined,
             devUrl: undefined,
           }),
-          DEFAULT_DEV_STATE_DIR,
+          DEFAULT_DEV_DATA_ROOT,
         ]);
 
-        assert.equal(env.T3CODE_STATE_DIR, defaultStateDir);
+        assert.equal(env.DATA_ROOT, defaultDataRoot);
       }),
     );
 
     it.effect("supports explicit typed overrides", () =>
       Effect.gen(function* () {
         const env = yield* createDevRunnerEnv({
-          mode: "dev:server",
           baseEnv: {},
           serverOffset: 0,
           webOffset: 0,
-          stateDir: "/tmp/override-state",
-          authToken: "secret",
+          dataRoot: "/tmp/override-state",
           noBrowser: true,
           autoBootstrapProjectFromCwd: false,
           logWebSocketEvents: true,
@@ -87,7 +83,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           devUrl: new URL("http://localhost:7331"),
         });
 
-        assert.equal(env.T3CODE_STATE_DIR, resolve("/tmp/override-state"));
+        assert.equal(env.DATA_ROOT, resolve("/tmp/override-state"));
         assert.equal(env.T3CODE_PORT, "4222");
         assert.equal(env.VITE_WS_URL, "ws://localhost:4222");
         assert.equal(env.T3CODE_NO_BROWSER, "1");
@@ -101,14 +97,12 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
     it.effect("does not force websocket logging on in dev mode when unset", () =>
       Effect.gen(function* () {
         const env = yield* createDevRunnerEnv({
-          mode: "dev",
           baseEnv: {
             T3CODE_LOG_WS_EVENTS: "keep-me-out",
           },
           serverOffset: 0,
           webOffset: 0,
-          stateDir: undefined,
-          authToken: undefined,
+          dataRoot: undefined,
           noBrowser: undefined,
           autoBootstrapProjectFromCwd: undefined,
           logWebSocketEvents: undefined,
@@ -117,7 +111,6 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           devUrl: undefined,
         });
 
-        assert.equal(env.T3CODE_MODE, "web");
         assert.equal(env.T3CODE_LOG_WS_EVENTS, undefined);
       }),
     );
@@ -125,12 +118,10 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
     it.effect("forwards explicit websocket logging false without coercing it away", () =>
       Effect.gen(function* () {
         const env = yield* createDevRunnerEnv({
-          mode: "dev",
           baseEnv: {},
           serverOffset: 0,
           webOffset: 0,
-          stateDir: undefined,
-          authToken: undefined,
+          dataRoot: undefined,
           noBrowser: undefined,
           autoBootstrapProjectFromCwd: undefined,
           logWebSocketEvents: false,

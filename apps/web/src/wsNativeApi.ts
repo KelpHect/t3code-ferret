@@ -103,6 +103,7 @@ export function createWsNativeApi(): NativeApi {
     },
     terminal: {
       open: (input) => transport.request(WS_METHODS.terminalOpen, input),
+      projectOpen: (input) => transport.request(WS_METHODS.terminalProjectOpen, input),
       write: (input) => transport.request(WS_METHODS.terminalWrite, input),
       resize: (input) => transport.request(WS_METHODS.terminalResize, input),
       clear: (input) => transport.request(WS_METHODS.terminalClear, input),
@@ -112,6 +113,12 @@ export function createWsNativeApi(): NativeApi {
         transport.subscribe(WS_CHANNELS.terminalEvent, (message) => callback(message.data)),
     },
     projects: {
+      list: () => transport.request(WS_METHODS.projectsList),
+      create: (input) => transport.request(WS_METHODS.projectsCreate, input),
+      get: (input) => transport.request(WS_METHODS.projectsGet, input),
+      archive: (input) => transport.request(WS_METHODS.projectsArchive, input),
+      listFiles: (input) => transport.request(WS_METHODS.projectsFilesList, input),
+      readFile: (input) => transport.request(WS_METHODS.projectsFilesRead, input),
       searchEntries: (input) => transport.request(WS_METHODS.projectsSearchEntries, input),
       writeFile: (input) => transport.request(WS_METHODS.projectsWriteFile, input),
     },
@@ -145,6 +152,14 @@ export function createWsNativeApi(): NativeApi {
       resolvePullRequest: (input) => transport.request(WS_METHODS.gitResolvePullRequest, input),
       preparePullRequestThread: (input) =>
         transport.request(WS_METHODS.gitPreparePullRequestThread, input),
+      hosted: {
+        status: (input) => transport.request(WS_METHODS.gitHostedStatus, input),
+        branches: (input) => transport.request(WS_METHODS.gitHostedBranches, input),
+        commits: (input) => transport.request(WS_METHODS.gitHostedCommits, input),
+        diff: (input) => transport.request(WS_METHODS.gitHostedDiff, input),
+        createBranch: (input) => transport.request(WS_METHODS.gitHostedCreateBranch, input),
+        switchBranch: (input) => transport.request(WS_METHODS.gitHostedSwitchBranch, input),
+      },
     },
     contextMenu: {
       show: async <T extends string>(
@@ -160,6 +175,18 @@ export function createWsNativeApi(): NativeApi {
     server: {
       getConfig: () => transport.request(WS_METHODS.serverGetConfig),
       upsertKeybinding: (input) => transport.request(WS_METHODS.serverUpsertKeybinding, input),
+    },
+    jobs: {
+      list: (input) => transport.request(WS_METHODS.jobsList, input),
+      get: (input) => transport.request(WS_METHODS.jobsGet, input),
+      events: (input) => transport.request(WS_METHODS.jobsEvents, input),
+      runCommand: (input) => transport.request(WS_METHODS.jobsRunCommand, input),
+      agentPrompt: (input) => transport.request(WS_METHODS.jobsAgentPrompt, input),
+    },
+    providers: {
+      list: () => transport.request(WS_METHODS.providersList),
+      beginLogin: (input) => transport.request(WS_METHODS.providersBeginLogin, input),
+      logout: (input) => transport.request(WS_METHODS.providersLogout, input),
     },
     orchestration: {
       getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),

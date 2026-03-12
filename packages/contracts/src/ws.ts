@@ -37,16 +37,39 @@ import { KeybindingRule } from "./keybindings";
 import { ProjectSearchEntriesInput, ProjectWriteFileInput } from "./project";
 import { OpenInEditorInput } from "./editor";
 import { ServerConfigUpdatedPayload } from "./server";
+import {
+  HostedAgentPromptJobInput,
+  HostedGitBranchMutationInput,
+  HostedGitCommitListInput,
+  HostedGitDiffInput,
+  HostedJob,
+  HostedJobEvent,
+  HostedJobEventsInput,
+  HostedJobIdInput,
+  HostedJobListInput,
+  HostedProjectCreateInput,
+  HostedProjectFileListInput,
+  HostedProjectFileReadInput,
+  HostedProjectIdInput,
+  HostedProjectSearchEntriesInput,
+  HostedProjectWriteFileInput,
+  HostedProviderBeginLoginInput,
+  HostedRunCommandJobInput,
+  HostedTerminalProjectOpenInput,
+} from "./hosted";
 
 // ── WebSocket RPC Method Names ───────────────────────────────────────
 
 export const WS_METHODS = {
   // Project registry methods
   projectsList: "projects.list",
-  projectsAdd: "projects.add",
-  projectsRemove: "projects.remove",
+  projectsCreate: "projects.create",
+  projectsGet: "projects.get",
+  projectsArchive: "projects.archive",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectsFilesList: "projects.files.list",
+  projectsFilesRead: "projects.files.read",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -63,6 +86,12 @@ export const WS_METHODS = {
   gitInit: "git.init",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
+  gitHostedStatus: "git.hosted.status",
+  gitHostedBranches: "git.hosted.branches",
+  gitHostedCommits: "git.hosted.commits",
+  gitHostedDiff: "git.hosted.diff",
+  gitHostedCreateBranch: "git.hosted.createBranch",
+  gitHostedSwitchBranch: "git.hosted.switchBranch",
 
   // Terminal methods
   terminalOpen: "terminal.open",
@@ -71,6 +100,19 @@ export const WS_METHODS = {
   terminalClear: "terminal.clear",
   terminalRestart: "terminal.restart",
   terminalClose: "terminal.close",
+  terminalProjectOpen: "terminal.project.open",
+
+  // Jobs
+  jobsList: "jobs.list",
+  jobsGet: "jobs.get",
+  jobsEvents: "jobs.events",
+  jobsRunCommand: "jobs.runCommand",
+  jobsAgentPrompt: "jobs.agentPrompt",
+
+  // Providers
+  providersList: "providers.list",
+  providersBeginLogin: "providers.beginLogin",
+  providersLogout: "providers.logout",
 
   // Server meta
   serverGetConfig: "server.getConfig",
@@ -83,6 +125,8 @@ export const WS_CHANNELS = {
   terminalEvent: "terminal.event",
   serverWelcome: "server.welcome",
   serverConfigUpdated: "server.configUpdated",
+  jobEvent: "jobs.event",
+  jobUpdated: "jobs.updated",
 } as const;
 
 // -- Tagged Union of all request body schemas ─────────────────────────
@@ -109,8 +153,16 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(ORCHESTRATION_WS_METHODS.replayEvents, OrchestrationReplayEventsInput),
 
   // Project Search
+  tagRequestBody(WS_METHODS.projectsList, Schema.Struct({})),
+  tagRequestBody(WS_METHODS.projectsCreate, HostedProjectCreateInput),
+  tagRequestBody(WS_METHODS.projectsGet, HostedProjectIdInput),
+  tagRequestBody(WS_METHODS.projectsArchive, HostedProjectIdInput),
   tagRequestBody(WS_METHODS.projectsSearchEntries, ProjectSearchEntriesInput),
+  tagRequestBody(WS_METHODS.projectsSearchEntries, HostedProjectSearchEntriesInput),
   tagRequestBody(WS_METHODS.projectsWriteFile, ProjectWriteFileInput),
+  tagRequestBody(WS_METHODS.projectsWriteFile, HostedProjectWriteFileInput),
+  tagRequestBody(WS_METHODS.projectsFilesList, HostedProjectFileListInput),
+  tagRequestBody(WS_METHODS.projectsFilesRead, HostedProjectFileReadInput),
 
   // Shell methods
   tagRequestBody(WS_METHODS.shellOpenInEditor, OpenInEditorInput),
@@ -127,6 +179,12 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.gitInit, GitInitInput),
   tagRequestBody(WS_METHODS.gitResolvePullRequest, GitPullRequestRefInput),
   tagRequestBody(WS_METHODS.gitPreparePullRequestThread, GitPreparePullRequestThreadInput),
+  tagRequestBody(WS_METHODS.gitHostedStatus, HostedProjectIdInput),
+  tagRequestBody(WS_METHODS.gitHostedBranches, HostedProjectIdInput),
+  tagRequestBody(WS_METHODS.gitHostedCommits, HostedGitCommitListInput),
+  tagRequestBody(WS_METHODS.gitHostedDiff, HostedGitDiffInput),
+  tagRequestBody(WS_METHODS.gitHostedCreateBranch, HostedGitBranchMutationInput),
+  tagRequestBody(WS_METHODS.gitHostedSwitchBranch, HostedGitBranchMutationInput),
 
   // Terminal methods
   tagRequestBody(WS_METHODS.terminalOpen, TerminalOpenInput),
@@ -135,6 +193,19 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.terminalClear, TerminalClearInput),
   tagRequestBody(WS_METHODS.terminalRestart, TerminalRestartInput),
   tagRequestBody(WS_METHODS.terminalClose, TerminalCloseInput),
+  tagRequestBody(WS_METHODS.terminalProjectOpen, HostedTerminalProjectOpenInput),
+
+  // Jobs
+  tagRequestBody(WS_METHODS.jobsList, HostedJobListInput),
+  tagRequestBody(WS_METHODS.jobsGet, HostedJobIdInput),
+  tagRequestBody(WS_METHODS.jobsEvents, HostedJobEventsInput),
+  tagRequestBody(WS_METHODS.jobsRunCommand, HostedRunCommandJobInput),
+  tagRequestBody(WS_METHODS.jobsAgentPrompt, HostedAgentPromptJobInput),
+
+  // Providers
+  tagRequestBody(WS_METHODS.providersList, Schema.Struct({})),
+  tagRequestBody(WS_METHODS.providersBeginLogin, HostedProviderBeginLoginInput),
+  tagRequestBody(WS_METHODS.providersLogout, HostedProviderBeginLoginInput),
 
   // Server meta
   tagRequestBody(WS_METHODS.serverGetConfig, Schema.Struct({})),
@@ -173,6 +244,8 @@ export interface WsPushPayloadByChannel {
   readonly [WS_CHANNELS.serverWelcome]: WsWelcomePayload;
   readonly [WS_CHANNELS.serverConfigUpdated]: typeof ServerConfigUpdatedPayload.Type;
   readonly [WS_CHANNELS.terminalEvent]: typeof TerminalEvent.Type;
+  readonly [WS_CHANNELS.jobEvent]: HostedJobEvent;
+  readonly [WS_CHANNELS.jobUpdated]: HostedJob;
   readonly [ORCHESTRATION_WS_CHANNELS.domainEvent]: OrchestrationEvent;
 }
 
@@ -196,6 +269,8 @@ export const WsPushServerConfigUpdated = makeWsPushSchema(
   ServerConfigUpdatedPayload,
 );
 export const WsPushTerminalEvent = makeWsPushSchema(WS_CHANNELS.terminalEvent, TerminalEvent);
+export const WsPushJobEvent = makeWsPushSchema(WS_CHANNELS.jobEvent, HostedJobEvent);
+export const WsPushJobUpdated = makeWsPushSchema(WS_CHANNELS.jobUpdated, HostedJob);
 export const WsPushOrchestrationDomainEvent = makeWsPushSchema(
   ORCHESTRATION_WS_CHANNELS.domainEvent,
   OrchestrationEvent,
@@ -205,6 +280,8 @@ export const WsPushChannelSchema = Schema.Literals([
   WS_CHANNELS.serverWelcome,
   WS_CHANNELS.serverConfigUpdated,
   WS_CHANNELS.terminalEvent,
+  WS_CHANNELS.jobEvent,
+  WS_CHANNELS.jobUpdated,
   ORCHESTRATION_WS_CHANNELS.domainEvent,
 ]);
 export type WsPushChannelSchema = typeof WsPushChannelSchema.Type;
@@ -213,6 +290,8 @@ export const WsPush = Schema.Union([
   WsPushServerWelcome,
   WsPushServerConfigUpdated,
   WsPushTerminalEvent,
+  WsPushJobEvent,
+  WsPushJobUpdated,
   WsPushOrchestrationDomainEvent,
 ]);
 export type WsPush = typeof WsPush.Type;

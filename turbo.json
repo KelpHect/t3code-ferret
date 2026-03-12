@@ -4,19 +4,20 @@
     "PORT",
     "VITE_WS_URL",
     "VITE_DEV_SERVER_URL",
-    "ELECTRON_RENDERER_PORT",
     "T3CODE_LOG_WS_EVENTS",
-    "T3CODE_MODE",
     "T3CODE_PORT",
     "T3CODE_NO_BROWSER",
-    "T3CODE_STATE_DIR",
-    "T3CODE_AUTH_TOKEN",
-    "T3CODE_DESKTOP_WS_URL"
+    "DATA_ROOT",
+    "CLERK_SECRET_KEY",
+    "VITE_CLERK_PUBLISHABLE_KEY",
+    "CLERK_ALLOWED_USER_IDS",
+    "CLERK_ALLOWED_EMAILS",
+    "CLERK_ALLOWED_EMAIL_DOMAINS"
   ],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**", "dist-electron/**"]
+      "outputs": ["dist/**"]
     },
     "dev": {
       "dependsOn": ["@t3tools/contracts#build"],

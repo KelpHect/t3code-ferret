@@ -25,6 +25,8 @@ import {
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./ui/menu";
 import { readNativeApi } from "~/nativeApi";
 import { toastManager } from "./ui/toast";
+import { getRuntimePublicConfig } from "../runtimeConfig";
+import type { ProjectId } from "@t3tools/contracts";
 
 function stepStatusIcon(status: string): React.ReactNode {
   if (status === "completed") {
@@ -52,6 +54,7 @@ interface PlanSidebarProps {
   activePlan: ActivePlanState | null;
   activeProposedPlan: LatestProposedPlanState | null;
   markdownCwd: string | undefined;
+  projectId: ProjectId | undefined;
   workspaceRoot: string | undefined;
   onClose: () => void;
 }
@@ -60,6 +63,7 @@ const PlanSidebar = memo(function PlanSidebar({
   activePlan,
   activeProposedPlan,
   markdownCwd,
+  projectId,
   workspaceRoot,
   onClose,
 }: PlanSidebarProps) {
@@ -86,20 +90,38 @@ const PlanSidebar = memo(function PlanSidebar({
 
   const handleSaveToWorkspace = useCallback(() => {
     const api = readNativeApi();
-    if (!api || !workspaceRoot || !planMarkdown) return;
+    const runtimeConfig = getRuntimePublicConfig();
+    if (!api || !planMarkdown) return;
     const filename = buildProposedPlanMarkdownFilename(planMarkdown);
     setIsSavingToWorkspace(true);
-    void api.projects
-      .writeFile({
+    let saveOperation: ReturnType<typeof api.projects.writeFile>;
+    if (runtimeConfig.deploymentMode === "self-hosted") {
+      if (!projectId) {
+        setIsSavingToWorkspace(false);
+        return;
+      }
+      saveOperation = api.projects.writeFile({
+        projectId,
+        path: filename,
+        contents: normalizePlanMarkdownForExport(planMarkdown),
+      });
+    } else {
+      if (!workspaceRoot) {
+        setIsSavingToWorkspace(false);
+        return;
+      }
+      saveOperation = api.projects.writeFile({
         cwd: workspaceRoot,
         relativePath: filename,
         contents: normalizePlanMarkdownForExport(planMarkdown),
-      })
+      });
+    }
+    void saveOperation
       .then((result) => {
         toastManager.add({
           type: "success",
           title: "Plan saved",
-          description: result.relativePath,
+          description: "path" in result ? result.path : result.relativePath,
         });
       })
       .catch((error) => {
@@ -113,7 +135,7 @@ const PlanSidebar = memo(function PlanSidebar({
         () => setIsSavingToWorkspace(false),
         () => setIsSavingToWorkspace(false),
       );
-  }, [planMarkdown, workspaceRoot]);
+  }, [planMarkdown, projectId, workspaceRoot]);
 
   return (
     <div className="flex h-full w-[340px] shrink-0 flex-col border-l border-border/70 bg-card/50">
@@ -154,7 +176,12 @@ const PlanSidebar = memo(function PlanSidebar({
                 <MenuItem onClick={handleDownload}>Download as markdown</MenuItem>
                 <MenuItem
                   onClick={handleSaveToWorkspace}
-                  disabled={!workspaceRoot || isSavingToWorkspace}
+                  disabled={
+                    isSavingToWorkspace ||
+                    (getRuntimePublicConfig().deploymentMode === "self-hosted"
+                      ? !projectId
+                      : !workspaceRoot)
+                  }
                 >
                   Save to workspace
                 </MenuItem>

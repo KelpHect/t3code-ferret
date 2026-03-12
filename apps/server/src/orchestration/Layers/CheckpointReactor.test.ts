@@ -158,11 +158,15 @@ async function waitForEvent(
 }
 
 function runGit(cwd: string, args: ReadonlyArray<string>) {
-  return execFileSync("git", args, {
+  return execFileSync("git", ["-c", "core.autocrlf=false", ...args], {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
   });
+}
+
+function normalizeLineEndings(value: string) {
+  return value.replace(/\r\n/g, "\n");
 }
 
 function createGitRepository() {
@@ -786,7 +790,9 @@ describe("CheckpointReactor", () => {
       threadId: ThreadId.makeUnsafe("thread-1"),
       numTurns: 1,
     });
-    expect(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8")).toBe("v2\n");
+    expect(normalizeLineEndings(fs.readFileSync(path.join(harness.cwd, "README.md"), "utf8"))).toBe(
+      "v2\n",
+    );
     expect(
       gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.makeUnsafe("thread-1"), 2)),
     ).toBe(false);

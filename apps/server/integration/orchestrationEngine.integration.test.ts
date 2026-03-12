@@ -42,6 +42,10 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function normalizeLineEndings(value: string) {
+  return value.replace(/\r\n/g, "\n");
+}
+
 class IntegrationWaitTimeoutError extends Schema.TaggedErrorClass<IntegrationWaitTimeoutError>()(
   "IntegrationWaitTimeoutError",
   {
@@ -831,7 +835,10 @@ it.live("reverts to an earlier checkpoint and trims checkpoint projections + git
         ),
         true,
       );
-      assert.equal(fs.readFileSync(path.join(harness.workspaceDir, "README.md"), "utf8"), "v2\n");
+      assert.equal(
+        normalizeLineEndings(fs.readFileSync(path.join(harness.workspaceDir, "README.md"), "utf8")),
+        "v2\n",
+      );
       assert.equal(
         gitRefExists(harness.workspaceDir, checkpointRefForThreadTurn(THREAD_ID, 2)),
         false,

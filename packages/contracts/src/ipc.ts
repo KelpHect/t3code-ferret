@@ -24,7 +24,7 @@ import type {
   ProjectWriteFileInput,
   ProjectWriteFileResult,
 } from "./project";
-import type { ServerConfig } from "./server";
+import type { RuntimePublicConfig, ServerConfig } from "./server";
 import type {
   TerminalClearInput,
   TerminalCloseInput,
@@ -46,6 +46,39 @@ import type {
   OrchestrationReadModel,
 } from "./orchestration";
 import { EditorId } from "./editor";
+import type {
+  HostedAgentPromptJobInput,
+  HostedGitBranchMutationInput,
+  HostedGitBranchesResult,
+  HostedGitCommitListInput,
+  HostedGitCommitListResult,
+  HostedGitDiffInput,
+  HostedGitDiffResult,
+  HostedGitStatus,
+  HostedJob,
+  HostedJobEventsInput,
+  HostedJobEventsResult,
+  HostedJobIdInput,
+  HostedJobListInput,
+  HostedJobListResult,
+  HostedProject,
+  HostedProjectCreateInput,
+  HostedProjectCreateResult,
+  HostedProjectFileListInput,
+  HostedProjectFileListResult,
+  HostedProjectFileReadInput,
+  HostedProjectFileReadResult,
+  HostedProjectIdInput,
+  HostedProjectSearchEntriesInput,
+  HostedProjectWriteFileInput,
+  HostedProjectWriteFileResult,
+  HostedProviderBeginLoginInput,
+  HostedProviderBeginLoginResult,
+  HostedProviderListResult,
+  HostedProviderLogoutResult,
+  HostedRunCommandJobInput,
+  HostedTerminalProjectOpenInput,
+} from "./hosted";
 
 export interface ContextMenuItem<T extends string = string> {
   id: T;
@@ -118,6 +151,7 @@ export interface NativeApi {
   };
   terminal: {
     open: (input: TerminalOpenInput) => Promise<TerminalSessionSnapshot>;
+    projectOpen: (input: HostedTerminalProjectOpenInput) => Promise<TerminalSessionSnapshot>;
     write: (input: TerminalWriteInput) => Promise<void>;
     resize: (input: TerminalResizeInput) => Promise<void>;
     clear: (input: TerminalClearInput) => Promise<void>;
@@ -126,8 +160,18 @@ export interface NativeApi {
     onEvent: (callback: (event: TerminalEvent) => void) => () => void;
   };
   projects: {
-    searchEntries: (input: ProjectSearchEntriesInput) => Promise<ProjectSearchEntriesResult>;
-    writeFile: (input: ProjectWriteFileInput) => Promise<ProjectWriteFileResult>;
+    list: () => Promise<HostedProject[]>;
+    create: (input: HostedProjectCreateInput) => Promise<HostedProjectCreateResult>;
+    get: (input: HostedProjectIdInput) => Promise<HostedProject>;
+    archive: (input: HostedProjectIdInput) => Promise<HostedProject>;
+    listFiles: (input: HostedProjectFileListInput) => Promise<HostedProjectFileListResult>;
+    readFile: (input: HostedProjectFileReadInput) => Promise<HostedProjectFileReadResult>;
+    searchEntries: (
+      input: ProjectSearchEntriesInput | HostedProjectSearchEntriesInput,
+    ) => Promise<ProjectSearchEntriesResult>;
+    writeFile: (
+      input: ProjectWriteFileInput | HostedProjectWriteFileInput,
+    ) => Promise<ProjectWriteFileResult | HostedProjectWriteFileResult>;
   };
   shell: {
     openInEditor: (cwd: string, editor: EditorId) => Promise<void>;
@@ -149,6 +193,14 @@ export interface NativeApi {
     pull: (input: GitPullInput) => Promise<GitPullResult>;
     status: (input: GitStatusInput) => Promise<GitStatusResult>;
     runStackedAction: (input: GitRunStackedActionInput) => Promise<GitRunStackedActionResult>;
+    hosted: {
+      status: (input: HostedProjectIdInput) => Promise<HostedGitStatus>;
+      branches: (input: HostedProjectIdInput) => Promise<HostedGitBranchesResult>;
+      commits: (input: HostedGitCommitListInput) => Promise<HostedGitCommitListResult>;
+      diff: (input: HostedGitDiffInput) => Promise<HostedGitDiffResult>;
+      createBranch: (input: HostedGitBranchMutationInput) => Promise<void>;
+      switchBranch: (input: HostedGitBranchMutationInput) => Promise<void>;
+    };
   };
   contextMenu: {
     show: <T extends string>(
@@ -158,7 +210,20 @@ export interface NativeApi {
   };
   server: {
     getConfig: () => Promise<ServerConfig>;
+    getRuntimeConfig?: () => Promise<RuntimePublicConfig>;
     upsertKeybinding: (input: ServerUpsertKeybindingInput) => Promise<ServerUpsertKeybindingResult>;
+  };
+  jobs: {
+    list: (input: HostedJobListInput) => Promise<HostedJobListResult>;
+    get: (input: HostedJobIdInput) => Promise<HostedJob>;
+    events: (input: HostedJobEventsInput) => Promise<HostedJobEventsResult>;
+    runCommand: (input: HostedRunCommandJobInput) => Promise<HostedJob>;
+    agentPrompt: (input: HostedAgentPromptJobInput) => Promise<HostedJob>;
+  };
+  providers: {
+    list: () => Promise<HostedProviderListResult>;
+    beginLogin: (input: HostedProviderBeginLoginInput) => Promise<HostedProviderBeginLoginResult>;
+    logout: (input: HostedProviderBeginLoginInput) => Promise<HostedProviderLogoutResult>;
   };
   orchestration: {
     getSnapshot: () => Promise<OrchestrationReadModel>;

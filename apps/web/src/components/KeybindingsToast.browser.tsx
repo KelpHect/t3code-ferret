@@ -39,6 +39,7 @@ const wsLink = ws.link(/ws(s)?:\/\/.*/);
 
 function createBaseServerConfig(): ServerConfig {
   return {
+    deploymentMode: "local",
     cwd: "/repo/project",
     keybindingsConfigPath: "/repo/project/.t3code-keybindings.json",
     keybindings: [],
@@ -53,6 +54,14 @@ function createBaseServerConfig(): ServerConfig {
       },
     ],
     availableEditors: [],
+    viewer: null,
+    localCapabilities: {
+      workspaceRegistration: true,
+      cwdRouting: true,
+      worktrees: true,
+      stackedGitActions: true,
+      pullRequestThreads: true,
+    },
   };
 }
 

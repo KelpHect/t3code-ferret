@@ -442,6 +442,13 @@ function compileKeybindings(bindings: KeybindingsConfig): ResolvedKeybindingsCon
 
 const DEFAULT_RESOLVED_KEYBINDINGS = compileKeybindings([...DEFAULT_KEYBINDINGS]);
 const VALID_EDITOR_IDS = new Set(EDITORS.map((editor) => editor.id));
+const LOCAL_SERVER_CAPABILITIES = {
+  cwdRouting: true,
+  pullRequestThreads: true,
+  stackedGitActions: true,
+  workspaceRegistration: true,
+  worktrees: true,
+} as const;
 
 function expectAvailableEditors(value: unknown): void {
   expect(Array.isArray(value)).toBe(true);
@@ -449,6 +456,30 @@ function expectAvailableEditors(value: unknown): void {
     expect(typeof editorId).toBe("string");
     expect(VALID_EDITOR_IDS.has(editorId as (typeof EDITORS)[number]["id"])).toBe(true);
   }
+}
+
+function expectLocalServerConfig(
+  result: unknown,
+  input: {
+    cwd: string;
+    keybindingsConfigPath: string;
+    keybindings: ResolvedKeybindingsConfig;
+    issues: unknown;
+    providers?: ReadonlyArray<ServerProviderStatus>;
+  },
+): void {
+  expect(result).toEqual({
+    cwd: input.cwd,
+    deploymentMode: "local",
+    viewer: null,
+    localCapabilities: LOCAL_SERVER_CAPABILITIES,
+    keybindingsConfigPath: input.keybindingsConfigPath,
+    keybindings: input.keybindings,
+    issues: input.issues,
+    providers: input.providers ?? defaultProviderStatuses,
+    availableEditors: expect.any(Array),
+  });
+  expectAvailableEditors((result as { availableEditors: unknown }).availableEditors);
 }
 
 describe("WebSocket Server", () => {
@@ -473,7 +504,6 @@ describe("WebSocket Server", () => {
       autoBootstrapProjectFromCwd?: boolean;
       logWebSocketEvents?: boolean;
       devUrl?: string;
-      authToken?: string;
       stateDir?: string;
       staticDir?: string;
       providerLayer?: Layer.Layer<ProviderService, never>;
@@ -498,16 +528,23 @@ describe("WebSocket Server", () => {
     );
     const openLayer = Layer.succeed(Open, options.open ?? defaultOpenService);
     const serverConfigLayer = Layer.succeed(ServerConfig, {
-      mode: "web",
+      deploymentMode: "local",
       port: 0,
       host: undefined,
       cwd: options.cwd ?? "/test/project",
+      dataRoot: stateDir,
+      databasePath: path.join(stateDir, "db", "state.sqlite"),
       keybindingsConfigPath: path.join(stateDir, "keybindings.json"),
       stateDir,
       staticDir: options.staticDir,
       devUrl: options.devUrl ? new URL(options.devUrl) : undefined,
       noBrowser: true,
-      authToken: options.authToken,
+      clerkSecretKey: undefined,
+      clerkPublishableKey: undefined,
+      clerkAllowedUserIds: [],
+      clerkAllowedEmails: [],
+      clerkAllowedEmailDomains: [],
+      publicBaseUrl: undefined,
       autoBootstrapProjectFromCwd: options.autoBootstrapProjectFromCwd ?? false,
       logWebSocketEvents: options.logWebSocketEvents ?? Boolean(options.devUrl),
     } satisfies ServerConfigShape);
@@ -824,15 +861,13 @@ describe("WebSocket Server", () => {
 
     const response = await sendRequest(ws, WS_METHODS.serverGetConfig);
     expect(response.error).toBeUndefined();
-    expect(response.result).toEqual({
+    expectLocalServerConfig(response.result, {
       cwd: "/my/workspace",
       keybindingsConfigPath: keybindingsPath,
       keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
       issues: [],
       providers: defaultProviderStatuses,
-      availableEditors: expect.any(Array),
     });
-    expectAvailableEditors((response.result as { availableEditors: unknown }).availableEditors);
   });
 
   it("bootstraps default keybindings file when missing", async () => {
@@ -849,15 +884,13 @@ describe("WebSocket Server", () => {
 
     const response = await sendRequest(ws, WS_METHODS.serverGetConfig);
     expect(response.error).toBeUndefined();
-    expect(response.result).toEqual({
+    expectLocalServerConfig(response.result, {
       cwd: "/my/workspace",
       keybindingsConfigPath: keybindingsPath,
       keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
       issues: [],
       providers: defaultProviderStatuses,
-      availableEditors: expect.any(Array),
     });
-    expectAvailableEditors((response.result as { availableEditors: unknown }).availableEditors);
 
     const persistedConfig = JSON.parse(
       fs.readFileSync(keybindingsPath, "utf8"),
@@ -879,7 +912,7 @@ describe("WebSocket Server", () => {
 
     const response = await sendRequest(ws, WS_METHODS.serverGetConfig);
     expect(response.error).toBeUndefined();
-    expect(response.result).toEqual({
+    expectLocalServerConfig(response.result, {
       cwd: "/my/workspace",
       keybindingsConfigPath: keybindingsPath,
       keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
@@ -890,9 +923,7 @@ describe("WebSocket Server", () => {
         },
       ],
       providers: defaultProviderStatuses,
-      availableEditors: expect.any(Array),
     });
-    expectAvailableEditors((response.result as { availableEditors: unknown }).availableEditors);
     expect(fs.readFileSync(keybindingsPath, "utf8")).toBe("{ not-json");
   });
 
@@ -1031,15 +1062,13 @@ describe("WebSocket Server", () => {
     const persistedConfig = JSON.parse(
       fs.readFileSync(keybindingsPath, "utf8"),
     ) as KeybindingsConfig;
-    expect(response.result).toEqual({
+    expectLocalServerConfig(response.result, {
       cwd: "/my/workspace",
       keybindingsConfigPath: keybindingsPath,
       keybindings: compileKeybindings(persistedConfig),
       issues: [],
       providers: defaultProviderStatuses,
-      availableEditors: expect.any(Array),
     });
-    expectAvailableEditors((response.result as { availableEditors: unknown }).availableEditors);
   });
 
   it("upserts keybinding rules and updates cached server config", async () => {
@@ -1078,17 +1107,13 @@ describe("WebSocket Server", () => {
 
     const configResponse = await sendRequest(ws, WS_METHODS.serverGetConfig);
     expect(configResponse.error).toBeUndefined();
-    expect(configResponse.result).toEqual({
+    expectLocalServerConfig(configResponse.result, {
       cwd: "/my/workspace",
       keybindingsConfigPath: keybindingsPath,
       keybindings: compileKeybindings(persistedConfig),
       issues: [],
       providers: defaultProviderStatuses,
-      availableEditors: expect.any(Array),
     });
-    expectAvailableEditors(
-      (configResponse.result as { availableEditors: unknown }).availableEditors,
-    );
   });
 
   it("returns error for unknown methods", async () => {
@@ -1514,7 +1539,7 @@ describe("WebSocket Server", () => {
     }
   });
 
-  it("returns errors for removed projects CRUD methods", async () => {
+  it("rejects hosted project RPC methods in local mode", async () => {
     server = await createTestServer({ cwd: "/test" });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
@@ -1524,19 +1549,19 @@ describe("WebSocket Server", () => {
 
     const listResponse = await sendRequest(ws, WS_METHODS.projectsList);
     expect(listResponse.result).toBeUndefined();
-    expect(listResponse.error?.message).toContain("Invalid request format");
+    expect(listResponse.error?.message).toContain("self-hosted mode");
 
-    const addResponse = await sendRequest(ws, WS_METHODS.projectsAdd, {
-      cwd: "/tmp/project-a",
+    const createResponse = await sendRequest(ws, WS_METHODS.projectsCreate, {
+      name: "Project A",
     });
-    expect(addResponse.result).toBeUndefined();
-    expect(addResponse.error?.message).toContain("Invalid request format");
+    expect(createResponse.result).toBeUndefined();
+    expect(createResponse.error?.message).toContain("self-hosted mode");
 
-    const removeResponse = await sendRequest(ws, WS_METHODS.projectsRemove, {
-      id: "project-a",
+    const archiveResponse = await sendRequest(ws, WS_METHODS.projectsArchive, {
+      projectId: "project-a",
     });
-    expect(removeResponse.result).toBeUndefined();
-    expect(removeResponse.error?.message).toContain("Invalid request format");
+    expect(archiveResponse.result).toBeUndefined();
+    expect(archiveResponse.error?.message).toContain("self-hosted mode");
   });
 
   it("supports projects.searchEntries", async () => {
@@ -1802,14 +1827,15 @@ describe("WebSocket Server", () => {
     });
   });
 
-  it("rejects websocket connections without a valid auth token", async () => {
-    server = await createTestServer({ cwd: "/test", authToken: "secret-token" });
+  it("accepts websocket connections with or without a legacy token query", async () => {
+    server = await createTestServer({ cwd: "/test" });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
-    await expect(connectWs(port)).rejects.toThrow("WebSocket connection failed");
+    const [anonymousWs] = await connectAndAwaitWelcome(port);
+    connections.push(anonymousWs);
 
-    const [authorizedWs] = await connectAndAwaitWelcome(port, "secret-token");
-    connections.push(authorizedWs);
+    const [tokenWs] = await connectAndAwaitWelcome(port, "legacy-token");
+    connections.push(tokenWs);
   });
 });

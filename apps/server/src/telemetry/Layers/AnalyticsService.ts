@@ -41,7 +41,7 @@ const makeAnalyticsService = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig;
   const identifier = yield* getTelemetryIdentifier;
   const bufferRef = yield* Ref.make<ReadonlyArray<BufferedAnalyticsEvent>>([]);
-  const clientType = serverConfig.mode === "desktop" ? "desktop-app" : "cli-web-client";
+  const clientType = serverConfig.clerkSecretKey ? "hosted-server" : "local-server";
 
   const enqueueBufferedEvent = (event: string, properties?: Readonly<Record<string, unknown>>) =>
     Effect.flatMap(DateTime.now, (now) =>

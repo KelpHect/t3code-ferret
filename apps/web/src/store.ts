@@ -15,6 +15,7 @@ import {
 import { create } from "zustand";
 import { type ChatMessage, type Project, type Thread } from "./types";
 import { Debouncer } from "@tanstack/react-pacer";
+import { getRuntimePublicConfig } from "./runtimeConfig";
 
 // ── State ────────────────────────────────────────────────────────────
 
@@ -213,6 +214,10 @@ function inferProviderForThreadModel(input: {
 
 function resolveWsHttpOrigin(): string {
   if (typeof window === "undefined") return "";
+  const runtimeConfig = getRuntimePublicConfig();
+  if (runtimeConfig.deploymentMode === "self-hosted") {
+    return window.location.origin;
+  }
   const bridgeWsUrl = window.desktopBridge?.getWsUrl?.();
   const envWsUrl = import.meta.env.VITE_WS_URL as string | undefined;
   const wsCandidate =

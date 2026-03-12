@@ -1,11 +1,12 @@
-import type { ProjectSearchEntriesResult } from "@t3tools/contracts";
+import type { ProjectId, ProjectSearchEntriesResult } from "@t3tools/contracts";
 import { queryOptions } from "@tanstack/react-query";
 import { ensureNativeApi } from "~/nativeApi";
+import { getRuntimePublicConfig } from "~/runtimeConfig";
 
 export const projectQueryKeys = {
   all: ["projects"] as const,
-  searchEntries: (cwd: string | null, query: string, limit: number) =>
-    ["projects", "search-entries", cwd, query, limit] as const,
+  searchEntries: (projectId: string | null, cwd: string | null, query: string, limit: number) =>
+    ["projects", "search-entries", projectId, cwd, query, limit] as const,
 };
 
 const DEFAULT_SEARCH_ENTRIES_LIMIT = 80;
@@ -16,6 +17,7 @@ const EMPTY_SEARCH_ENTRIES_RESULT: ProjectSearchEntriesResult = {
 };
 
 export function projectSearchEntriesQueryOptions(input: {
+  projectId?: ProjectId | null;
   cwd: string | null;
   query: string;
   enabled?: boolean;
@@ -23,10 +25,26 @@ export function projectSearchEntriesQueryOptions(input: {
   staleTime?: number;
 }) {
   const limit = input.limit ?? DEFAULT_SEARCH_ENTRIES_LIMIT;
+  const runtimeConfig = getRuntimePublicConfig();
   return queryOptions({
-    queryKey: projectQueryKeys.searchEntries(input.cwd, input.query, limit),
+    queryKey: projectQueryKeys.searchEntries(
+      input.projectId ?? null,
+      input.cwd,
+      input.query,
+      limit,
+    ),
     queryFn: async () => {
       const api = ensureNativeApi();
+      if (runtimeConfig.deploymentMode === "self-hosted") {
+        if (!input.projectId) {
+          throw new Error("Hosted workspace entry search is unavailable.");
+        }
+        return api.projects.searchEntries({
+          projectId: input.projectId,
+          query: input.query,
+          limit,
+        });
+      }
       if (!input.cwd) {
         throw new Error("Workspace entry search is unavailable.");
       }
@@ -36,7 +54,12 @@ export function projectSearchEntriesQueryOptions(input: {
         limit,
       });
     },
-    enabled: (input.enabled ?? true) && input.cwd !== null && input.query.length > 0,
+    enabled:
+      (input.enabled ?? true) &&
+      (runtimeConfig.deploymentMode === "self-hosted"
+        ? input.projectId !== null && input.projectId !== undefined
+        : input.cwd !== null) &&
+      input.query.length > 0,
     staleTime: input.staleTime ?? DEFAULT_SEARCH_ENTRIES_STALE_TIME,
     placeholderData: (previous) => previous ?? EMPTY_SEARCH_ENTRIES_RESULT,
   });

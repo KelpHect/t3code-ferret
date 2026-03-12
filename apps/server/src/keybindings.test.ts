@@ -33,6 +33,15 @@ const makeKeybindingsLayer = () =>
     ),
   );
 
+const makeKeybindingsLayerWithConfigPath = (keybindingsConfigPath: string) =>
+  KeybindingsLive.pipe(
+    Layer.provideMerge(
+      Layer.succeed(ServerConfig, {
+        keybindingsConfigPath,
+      } as ServerConfigShape),
+    ),
+  );
+
 const toDetailResult = <A, R>(effect: Effect.Effect<A, KeybindingsConfigError, R>) =>
   effect.pipe(
     Effect.mapError((error) => error.detail),
@@ -392,15 +401,16 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
     }).pipe(Effect.provide(makeKeybindingsLayer())),
   );
 
-  it.effect("fails when config directory is not writable", () =>
+  it.effect("fails when config parent path cannot be created", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
-      const { keybindingsConfigPath } = yield* ServerConfig;
-      const { dirname } = yield* Path.Path;
-      yield* writeKeybindingsConfig(keybindingsConfigPath, [
-        { key: "mod+j", command: "terminal.toggle" },
-      ]);
-      yield* fs.chmod(dirname(keybindingsConfigPath), 0o500);
+      const { join } = yield* Path.Path;
+      const rootDir = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3code-keybindings-parent-path-",
+      });
+      const blockedParentPath = join(rootDir, "blocked-parent");
+      const keybindingsConfigPath = join(blockedParentPath, "keybindings.json");
+      yield* fs.writeFileString(blockedParentPath, "not a directory");
 
       const result = yield* Effect.gen(function* () {
         const keybindings = yield* Keybindings;
@@ -408,15 +418,13 @@ it.layer(NodeServices.layer)("keybindings", (it) => {
           key: "mod+shift+r",
           command: "script.run-tests.run",
         });
-      }).pipe(toDetailResult);
+      }).pipe(
+        toDetailResult,
+        Effect.provide(makeKeybindingsLayerWithConfigPath(keybindingsConfigPath)),
+      );
       assertFailure(result, "failed to write keybindings config");
-
-      yield* fs.chmod(dirname(keybindingsConfigPath), 0o700);
-
-      const persisted = yield* readKeybindingsConfig(keybindingsConfigPath);
-      const persistedView = persisted.map(({ key, command }) => ({ key, command }));
-      assert.deepEqual(persistedView, [{ key: "mod+j", command: "terminal.toggle" }]);
-    }).pipe(Effect.provide(makeKeybindingsLayer())),
+      assert.equal(yield* fs.readFileString(blockedParentPath), "not a directory");
+    }),
   );
 
   it.effect("caches loaded resolved config across repeated reads", () =>

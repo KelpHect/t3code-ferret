@@ -68,7 +68,7 @@ import {
 import { ServerConfig } from "../src/config.ts";
 
 function runGit(cwd: string, args: ReadonlyArray<string>) {
-  return execFileSync("git", args, {
+  return execFileSync("git", ["-c", "core.autocrlf=false", ...args], {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
